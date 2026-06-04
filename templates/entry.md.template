@@ -1,0 +1,20 @@
+---
+id: {{YYYY-MM-DD}}-{{slug}}
+title: {{title}}
+created: {{ISO8601_UTC}}
+updated: {{ISO8601_UTC}}
+participants: []
+topics: []
+related: []
+sources: []
+status: active
+supersedes: []
+superseded_by: null
+contradicts: []
+decisions: []
+open_questions: []
+summary: |
+  {{two-paragraph distilled summary — what was discussed, what was decided, what's still open}}
+---
+
+{{raw transcript or notes}}

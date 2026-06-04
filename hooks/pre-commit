@@ -1,0 +1,31 @@
+#!/bin/bash
+# pre-commit — symlink this into kb-data/.git/hooks/pre-commit so every
+# commit in kb-data first runs the schema validator. Block the commit if
+# any invariant fails.
+#
+# Install:
+#   ln -sf $KB_ENGINE_DIR/hooks/pre-commit \
+#          $KB_DATA_DIR/.git/hooks/pre-commit
+#
+# Skip with: git commit --no-verify  (don't make a habit of this).
+#
+# This runs in a git context (no Claude session env), so it resolves paths
+# itself: KB_ENGINE_DIR from this script's real location (it is symlinked
+# into .git/hooks), KB_DATA_DIR from the git repo being committed.
+
+set -e
+
+# Resolve this script's real path even though it is invoked via the symlink.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+: "${KB_ENGINE_DIR:=$(dirname "$SCRIPT_DIR")}"
+
+# The kb-data being committed is this git repo's working-tree root.
+export KB_DATA_DIR="$(git rev-parse --show-toplevel)"
+
+exec "$KB_ENGINE_DIR/scripts/validate.py" --quiet

@@ -1,0 +1,266 @@
+#!/bin/bash
+# librarian — headless KB maintenance for Gregor's personal knowledge base.
+#
+# Usage:
+#   librarian file     --transcript <path> [--session-id <id>] [--hint <text>]
+#   librarian split    <kb-path>           [--session-id <id>]
+#   librarian collapse <kb-path>           [--session-id <id>]
+#   librarian dedup    <kb-path>           [--session-id <id>]
+#
+# Modes implemented:
+#   file     — file a conversation transcript into the KB (slice 2)
+#   split    — split a leaf folder into topic-coherent subfolders (slice 3a)
+#   collapse — merge sparse subfolders back into their parent (slice 3b)
+#   dedup    — flag superseded entries and contradictions (slice 3b)
+# Planned:
+#   link-fix, stale, compact (later slices)
+#
+# Acquires a lock on kb-data/.librarian.lock so multiple runs don't race.
+# Logs every run to kb-data/.librarian/log/<timestamp>-<session>-<mode>.md.
+
+set -euo pipefail
+
+# Resolve paths: prefer env (set by install into settings.json), else derive
+# from this script's location (scripts/ -> repo root -> kb-data).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+: "${KB_ENGINE_DIR:=$(dirname "$SCRIPT_DIR")}"
+: "${KB_DATA_DIR:=$KB_ENGINE_DIR/kb-data}"
+
+KB_ROOT="$KB_DATA_DIR"
+MECHANICS="$KB_ENGINE_DIR"
+LOCKDIR="$KB_ROOT/.librarian.lock"
+LOG_DIR="$KB_ROOT/.librarian/log"
+CLAUDE_BIN="${CLAUDE_BIN:-claude}"
+
+# --- arg parsing ---------------------------------------------------------
+
+MODE=""
+TRANSCRIPT=""
+SESSION_ID=""
+HINT=""
+FOLDER=""
+
+usage() {
+  sed -n '2,15p' "$0" >&2
+  exit 2
+}
+
+[ $# -lt 1 ] && usage
+
+MODE="$1"; shift
+case "$MODE" in
+  file|split|collapse|dedup) ;;
+  link-fix|stale|compact)
+    echo "mode '$MODE' not implemented yet" >&2
+    exit 2
+    ;;
+  -h|--help) usage ;;
+  *) echo "unknown mode: $MODE" >&2; usage ;;
+esac
+
+# split / collapse / dedup take a positional kb:/ path. Pull it off if present.
+if [[ "$MODE" =~ ^(split|collapse|dedup)$ ]] && [ $# -gt 0 ] && [[ "$1" != --* ]]; then
+  FOLDER="$1"; shift
+fi
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --transcript)  TRANSCRIPT="$2"; shift 2 ;;
+    --session-id)  SESSION_ID="$2"; shift 2 ;;
+    --hint)        HINT="$2"; shift 2 ;;
+    --folder)      FOLDER="$2"; shift 2 ;;
+    *) echo "unknown arg: $1" >&2; usage ;;
+  esac
+done
+
+if [ "$MODE" = "file" ] && [ -z "$TRANSCRIPT" ]; then
+  echo "--transcript <path> required for 'file' mode" >&2
+  exit 2
+fi
+if [[ "$MODE" =~ ^(split|collapse|dedup)$ ]] && [ -z "$FOLDER" ]; then
+  echo "$MODE requires a kb:/ folder path (positional or --folder)" >&2
+  exit 2
+fi
+if [ -n "$FOLDER" ] && [[ "$FOLDER" != kb:/* ]]; then
+  echo "folder must be a kb:/ URI, got: $FOLDER" >&2
+  exit 2
+fi
+
+[ -n "$SESSION_ID" ] || SESSION_ID="manual-$(date +%s)"
+
+# --- logging setup -------------------------------------------------------
+
+mkdir -p "$LOG_DIR"
+TS=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+LOG_FILE="$LOG_DIR/${TS}-${SESSION_ID}-${MODE}.md"
+
+log() { printf '%s\n' "$*" >> "$LOG_FILE"; }
+
+{
+  echo "# librarian run"
+  echo
+  echo "- mode: \`$MODE\`"
+  echo "- session: \`$SESSION_ID\`"
+  echo "- timestamp: \`$TS\`"
+  [ -n "$TRANSCRIPT" ] && echo "- transcript: \`$TRANSCRIPT\`"
+  [ -n "$FOLDER" ]     && echo "- folder: \`$FOLDER\`"
+  [ -n "$HINT" ]       && echo "- hint: \`$HINT\`"
+  echo
+} > "$LOG_FILE"
+
+# --- locking -------------------------------------------------------------
+
+acquire_lock() {
+  # Wait up to 600s (10 min) for the lock — covers ~6-10 stacked librarian
+  # runs at typical claude -p filing latency. Dead-PID detection means a
+  # crashed holder gets kicked out immediately (we don't need to wait it out).
+  local max_wait=600
+  local elapsed=0
+  while ! mkdir "$LOCKDIR" 2>/dev/null; do
+    # Check if held by a dead PID (stale lock) — take over immediately.
+    if [ -f "$LOCKDIR/pid" ]; then
+      local p; p=$(cat "$LOCKDIR/pid" 2>/dev/null || true)
+      if [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null; then
+        log "stale lock from dead pid $p — removing"
+        rm -rf "$LOCKDIR"
+        continue
+      fi
+    fi
+    if [ $elapsed -ge $max_wait ]; then
+      log "## ABORTED: lock held after ${max_wait}s"
+      exit 1
+    fi
+    # Quiet log: emit "still waiting" every 30s, not every second.
+    if [ $((elapsed % 30)) -eq 0 ] && [ $elapsed -gt 0 ]; then
+      local holder; holder=$(cat "$LOCKDIR/pid" 2>/dev/null || echo "?")
+      log "still waiting for lock (${elapsed}s elapsed; holder pid=$holder)"
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  echo $$ > "$LOCKDIR/pid"
+  trap 'rm -rf "$LOCKDIR"' EXIT
+}
+
+acquire_lock
+log "lock acquired (pid $$)"
+log
+
+# --- build prompt --------------------------------------------------------
+
+PROMPT_FILE=$(mktemp)
+trap 'rm -f "$PROMPT_FILE"; rm -rf "$LOCKDIR"' EXIT
+
+case "$MODE" in
+  file)
+    cat > "$PROMPT_FILE" <<EOF
+Read $MECHANICS/librarian/procedure-file.md and follow it.
+
+The conversation to file is the JSONL transcript at: $TRANSCRIPT
+Read that file with the Read tool to load the conversation. Each line is one message.
+
+User hint about placement (may be empty): $HINT
+
+**Trivial-skip check (this is an automated background run — be conservative):**
+Before doing anything else, judge whether this conversation is worth filing. SKIP if any of these apply:
+- Fewer than 3 substantive turns (greetings, single questions, /clear-style empties don't count)
+- Just a quick file lookup, log read, or shell command with no decision or insight
+- Just navigating ("what's in this folder", "show me the README") without producing content
+- The conversation is itself about debugging the librarian/KB infrastructure (avoid recursive filings)
+
+If skipping, output exactly: SKIPPED: <one-line reason>
+Then stop. Do NOT modify the KB.
+
+If filing, follow the procedure exactly. End with: FILED: <path of new entry>
+EOF
+    ;;
+  split)
+    cat > "$PROMPT_FILE" <<EOF
+Read $MECHANICS/librarian/procedure-split.md and follow it.
+
+Target folder: $FOLDER
+
+Resolve $FOLDER to its on-disk path: kb:/foo → $KB_DATA_DIR/foo.
+
+Follow the procedure exactly:
+1. Survey: read the target folder's _route.md and each leaf entry's frontmatter.
+2. Cluster: group entries into 2-4 topic-coherent clusters.
+3. Output PLAN.
+4. Apply the plan (mkdir, write _route.md from template, git mv entries, update parent _route.md, fix related: refs).
+5. Run $KB_ENGINE_DIR/scripts/validate.py — if errors, report them and stop.
+6. Output DONE summary.
+
+If the precondition checks fail (too few entries, entries cohere as one topic), output SKIPPED: <reason> and stop.
+If clustering produces a low-quality result, output ABORTED: <reason> and stop without writing anything.
+EOF
+    ;;
+  collapse)
+    cat > "$PROMPT_FILE" <<EOF
+Read $MECHANICS/librarian/procedure-collapse.md and follow it.
+
+Target parent folder: $FOLDER
+
+Resolve $FOLDER to its on-disk path: kb:/foo → $KB_DATA_DIR/foo.
+
+Follow the procedure exactly:
+1. Survey: read parent _route.md and each direct subfolder's _route.md + entries.
+2. Decide which (if any) subfolders should collapse into the parent.
+3. Output PLAN listing collapses + kept subfolders.
+4. Apply: git mv entries up, git rm subfolder _route.md, rmdir, update parent _route.md, fix related: refs.
+5. Run $KB_ENGINE_DIR/scripts/validate.py.
+6. Output DONE summary.
+
+If no subfolder is a good candidate, output SKIPPED: <reason> and stop.
+If collapses would over-flatten the parent (>15 entries) or produce a confused mix, output ABORTED: <reason> and stop.
+
+Conservative bias: when unsure, KEEP rather than collapse.
+EOF
+    ;;
+  dedup)
+    cat > "$PROMPT_FILE" <<EOF
+Read $MECHANICS/librarian/procedure-dedup.md and follow it.
+
+Scope: $FOLDER (recursive — operate on all leaf entries under this subtree)
+
+Resolve $FOLDER to its on-disk path: kb:/foo → $KB_DATA_DIR/foo.
+If $FOLDER is exactly "kb:/", scope is the whole tree.
+
+Follow the procedure exactly:
+1. Survey: read every active leaf entry's frontmatter under the scope. Skip status=superseded and status=archived.
+2. Find pairs that cover the same ground (same Jira/PR, same 1:1, same incident, same decision).
+3. Output PLAN listing pairs + actions.
+4. Apply: update older entry (status=superseded, superseded_by, updated), update newer (supersedes, contradicts, summary note if contradiction, updated). Update parent _route.md entries[] summary lines with [superseded] prefix.
+5. Run $KB_ENGINE_DIR/scripts/validate.py.
+6. Output DONE summary.
+
+Conservative bias: if not confident two entries cover the same ground, leave them alone.
+If no high-confidence pairs, output SKIPPED. If LLM confidence is low on ≥30% of proposed pairs, output ABORTED.
+EOF
+    ;;
+esac
+
+# --- run claude headless ------------------------------------------------
+
+log "## claude -p output"
+log
+log '```'
+
+cd "$KB_ROOT"
+
+set +e
+"$CLAUDE_BIN" -p "$(cat "$PROMPT_FILE")" \
+  --allowedTools "Read,Write,Edit,Bash,Glob,Grep,Agent" \
+  >> "$LOG_FILE" 2>&1
+EXIT_CODE=$?
+set -e
+
+log '```'
+log
+log "claude exit code: $EXIT_CODE"
+
+if [ $EXIT_CODE -ne 0 ]; then
+  log "## ERROR: claude -p exited non-zero"
+fi
+
+# trap handles lock + tmpfile cleanup
+exit $EXIT_CODE
