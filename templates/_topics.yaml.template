@@ -1,0 +1,27 @@
+# Controlled vocabulary for KB topic tags. (Starter file — customize for your domain.)
+#
+# Purpose: stop the same concept fragmenting into near-duplicate tags
+# (e.g. v4/V4, api/API/rest-api). Filing maps any free topic term to its
+# canonical form before writing frontmatter; scripts/audit-topics.py reports
+# and (with --fix) repairs drift in existing entries.
+#
+# Format: `canonical: [alias, alias, ...]`. A tag equal to an alias is rewritten
+# to its canonical. A tag that is neither canonical nor an alias is left as-is
+# (this is a living allow-list, not a hard gate). Alias matching is
+# case-insensitive; the canonical's exact casing wins.
+#
+# RULES
+# - Merge only true synonyms and case/format variants.
+# - NEVER merge terms that merely share a surface string but differ in meaning
+#   (see `polysemous`). Prefer a more specific canonical in those cases.
+
+canonical:
+  # Replace these examples with your own. A few illustrative entries:
+  kb: [knowledge-base, personal-knowledge-base]
+  # api: [rest-api, http-api]
+
+# Terms that look mergeable but are NOT — listed so a future pass never collapses them.
+# Each note records the distinct senses in play.
+polysemous: {}
+  # Example:
+  # state: "UI state vs US state vs state machine. Prefer the specific sense."

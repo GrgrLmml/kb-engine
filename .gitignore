@@ -1,0 +1,9 @@
+# An adopter's content when KB_DATA_DIR defaults to <repo>/kb-data
+kb-data/
+# librarian run logs (if any land here)
+.librarian/
+# python / tooling cruft
+__pycache__/
+*.pyc
+.venv/
+.DS_Store

@@ -1,0 +1,15 @@
+---
+type: route
+folder: {{kb:/ path of this folder, e.g. kb:/people/alex}}
+title: {{folder title}}
+purpose: {{one sentence — what lives in this folder}}
+last_indexed: {{ISO8601_UTC}}
+topics: []
+subroutes: []
+entries: []
+related: []
+---
+
+# {{folder title}}
+
+{{optional free-form prose}}
