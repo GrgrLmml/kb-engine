@@ -30,13 +30,19 @@ Spawn an Explore subagent to do the traversal so the main session's context stay
 >
 > 4. **Skip `superseded` and `archived` entries** unless the intent explicitly asks for history.
 >
-> 5. **Read the full WARM payload** (the `summary` field) for the top 3-5 entries you find. Also read `_route.md` files for the 1-2 most relevant folders.
+> 4b. **Check `kb:/recipes/` for a procedure that fits the intent.** This is high-value: if Gregor is about to *do* something he's done before, the recipe is the most useful thing to hand him. Read `kb:/recipes/_route.md`, then for each recipe match the intent against its **`when_to_use`** trigger (not just topics — `when_to_use` describes the situation). Pull the 1-3 recipes whose trigger fits. Note `status: draft` recipes as "(draft, unverified)".
+>
+> 5. **Read the full WARM payload** (the `summary` field) for the top 3-5 entries you find. Also read `_route.md` files for the 1-2 most relevant folders, and the `summary` + `steps` of any matched recipe.
 >
 > 6. **Return a structured brief** in this exact shape (markdown):
 >
 >    ```
 >    ## Intent
 >    <one-line restatement of what Gregor's doing, based on the matches>
+>
+>    ## Recipes for this
+>    - **<recipe title>** (`<kb:/recipes/...>`) — <when_to_use, one line>. Steps: <the steps outline, one line>.
+>    [up to 3; mark "(draft, unverified)" where status is draft. This section comes first because a matching recipe is the most actionable thing.]
 >
 >    ## Relevant entries
 >    - **<title>** (<id>, <date>) — <verbatim summary, possibly truncated to ~3 lines>

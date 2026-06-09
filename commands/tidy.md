@@ -19,6 +19,8 @@ Spawn one Agent subagent (general-purpose). Brief it:
 >
 > 3. **Dedup the subtree.** Follow `$KB_ENGINE_DIR/librarian/procedure-dedup.md` once for `$ARGUMENTS`. Apply if non-`SKIPPED`/`ABORTED`.
 >
+> 4. **Mine recipes.** Follow `$KB_ENGINE_DIR/librarian/procedure-mine-recipes.md` once for `$ARGUMENTS`. This mints any new recipes as `status: draft` (for review) and flags skill-graduation candidates. Apply if non-`SKIPPED`/`ABORTED`.
+>
 > Between each pass, run `$KB_ENGINE_DIR/scripts/validate.py`. If validation fails, stop and surface errors — do NOT continue to the next pass.
 >
 > When all passes finish (or one stops), output a summary table:
@@ -31,6 +33,7 @@ Spawn one Agent subagent (general-purpose). Brief it:
 > | Split    | <done|skipped|aborted|errored> | <one-line> |
 > | Collapse | <done|skipped|aborted|errored> | <one-line> |
 > | Dedup    | <done|skipped|aborted|errored> | <one-line> |
+> | Mine     | <done|skipped|aborted|errored> | <one-line — N draft recipes, K graduation flags> |
 >
 > Validator: <clean | N errors>
 > ```

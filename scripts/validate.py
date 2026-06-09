@@ -47,7 +47,7 @@ ENTRY_REQUIRED = {"id", "title", "created", "updated", "status", "summary"}
 ENTRY_OPTIONAL_PRESENT = {
     "participants", "topics", "related", "sources",
     "supersedes", "superseded_by", "contradicts",
-    "decisions", "open_questions",
+    "decisions", "open_questions", "recipe_candidate",
 }
 ENTRY_ALL = ENTRY_REQUIRED | ENTRY_OPTIONAL_PRESENT
 
@@ -55,7 +55,19 @@ ROUTE_REQUIRED = {"type", "folder", "title", "purpose", "last_indexed"}
 ROUTE_OPTIONAL_PRESENT = {"topics", "subroutes", "entries", "related"}
 ROUTE_ALL = ROUTE_REQUIRED | ROUTE_OPTIONAL_PRESENT
 
+# Recipes are evergreen procedural leaves (type: recipe), distinct from episodic
+# entries. They share the leaf machinery (id==stem, listed in parent route) but
+# carry procedural fields and have no date-prefixed id.
+RECIPE_REQUIRED = {"type", "id", "title", "created", "updated", "status",
+                   "when_to_use", "tools", "steps", "summary"}
+RECIPE_OPTIONAL_PRESENT = {
+    "inputs", "topics", "skill", "derived_from",
+    "related", "sources", "supersedes", "superseded_by", "last_verified",
+}
+RECIPE_ALL = RECIPE_REQUIRED | RECIPE_OPTIONAL_PRESENT
+
 VALID_STATUS = {"active", "superseded", "archived"}
+RECIPE_VALID_STATUS = {"active", "draft", "superseded"}
 ISO_UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 
@@ -64,7 +76,8 @@ class Validator:
     errors: list[tuple[Path, str]] = field(default_factory=list)
     ids_seen: dict[str, Path] = field(default_factory=dict)
     routes: dict[Path, dict] = field(default_factory=dict)   # _route.md path -> frontmatter
-    entries: dict[Path, dict] = field(default_factory=dict)  # leaf path -> frontmatter
+    entries: dict[Path, dict] = field(default_factory=dict)  # episodic leaf path -> frontmatter
+    recipes: dict[Path, dict] = field(default_factory=dict)  # recipe leaf path -> frontmatter
 
     def err(self, path: Path, msg: str) -> None:
         self.errors.append((path, msg))
@@ -182,6 +195,99 @@ class Validator:
         if isinstance(summary, str) and len(summary.strip()) < 20:
             self.err(file, f"summary too short ({len(summary.strip())} chars) — make it WARM-tier useful")
 
+        # recipe_candidate: bool if present (auto-flag for the mining pass)
+        rc = fm.get("recipe_candidate")
+        if rc is not None and not isinstance(rc, bool):
+            self.err(file, f"recipe_candidate must be true/false, got: {rc!r}")
+
+    # ------------------------------------------------------------ recipe checks
+
+    def validate_recipe(self, file: Path, fm: dict) -> None:
+        self.recipes[file] = fm
+
+        missing = RECIPE_REQUIRED - set(fm.keys())
+        if missing:
+            self.err(file, f"missing required recipe fields: {sorted(missing)}")
+        self.check_unknown_keys(file, fm, RECIPE_ALL, "recipe")
+
+        if fm.get("type") != "recipe":
+            self.err(file, f"type must be 'recipe', got: {fm.get('type')!r}")
+
+        # id matches filename stem (no date prefix); ids unique tree-wide
+        expected_id = file.stem
+        actual_id = fm.get("id")
+        if isinstance(actual_id, str):
+            if actual_id != expected_id:
+                self.err(file, f"id={actual_id!r} doesn't match filename stem {expected_id!r}")
+            if actual_id in self.ids_seen and self.ids_seen[actual_id] != file:
+                self.err(file, f"duplicate id {actual_id!r} (also at {self.ids_seen[actual_id]})")
+            else:
+                self.ids_seen[actual_id] = file
+
+        # status
+        if "status" in fm and fm["status"] not in RECIPE_VALID_STATUS:
+            self.err(file, f"recipe status must be one of {sorted(RECIPE_VALID_STATUS)}, got {fm['status']!r}")
+
+        # timestamps
+        for f_name in ("created", "updated"):
+            if f_name in fm:
+                self.check_iso_utc(file, f_name, fm[f_name])
+        lv = fm.get("last_verified")
+        if lv is not None:
+            self.check_iso_utc(file, "last_verified", lv)
+
+        # when_to_use: a descriptive trigger string
+        wtu = fm.get("when_to_use")
+        if not isinstance(wtu, str) or len(wtu.strip()) < 10:
+            self.err(file, "when_to_use must be a descriptive string (>=10 chars)")
+
+        # tools: normalized bare tokens (not kb:/ or http)
+        tools = fm.get("tools")
+        if not isinstance(tools, list):
+            self.err(file, "tools must be a list")
+        else:
+            for t in tools:
+                if not isinstance(t, str) or t.startswith("kb:/") or t.startswith("http"):
+                    self.err(file, f"tools[] should be a bare token, got: {t!r}")
+
+        # steps: non-empty ordered list
+        steps = fm.get("steps")
+        if not isinstance(steps, list) or len(steps) == 0:
+            self.err(file, "steps must be a non-empty list")
+
+        # inputs: list if present
+        inputs = fm.get("inputs")
+        if inputs is not None and not isinstance(inputs, list):
+            self.err(file, "inputs must be a list")
+
+        # skill: null or a skill-name string
+        skill = fm.get("skill")
+        if skill is not None and not isinstance(skill, str):
+            self.err(file, f"skill must be null or a skill name string, got: {skill!r}")
+
+        # derived_from / supersedes: bare ids, NOT kb:/ paths
+        for f_name in ("derived_from", "supersedes"):
+            for v in fm.get(f_name) or []:
+                if not isinstance(v, str) or v.startswith("kb:/") or v.startswith("http"):
+                    self.err(file, f"{f_name}[] should be a bare id, got: {v!r}")
+        sb = fm.get("superseded_by")
+        if sb is not None and (not isinstance(sb, str) or sb.startswith("kb:/") or sb.startswith("http")):
+            self.err(file, f"superseded_by should be null or a bare id, got: {sb!r}")
+
+        # related: kb:/ paths to existing files
+        for v in fm.get("related") or []:
+            self.check_kb_path(file, "related[]", v)
+
+        # sources: http(s) URLs
+        for v in fm.get("sources") or []:
+            if not isinstance(v, str) or not (v.startswith("http://") or v.startswith("https://")):
+                self.err(file, f"sources[] not an http(s) URL: {v!r}")
+
+        # summary present and non-trivial
+        summary = fm.get("summary")
+        if isinstance(summary, str) and len(summary.strip()) < 20:
+            self.err(file, f"summary too short ({len(summary.strip())} chars) — make it WARM-tier useful")
+
     # ------------------------------------------------------------- route checks
 
     def validate_route(self, file: Path, fm: dict) -> None:
@@ -234,8 +340,8 @@ class Validator:
     # --------------------------------------------------------- cross invariants
 
     def validate_crosslinks(self) -> None:
-        # Every leaf must appear in its parent _route.md's entries[]
-        for entry_path, entry_fm in self.entries.items():
+        # Every leaf (episodic entry or recipe) must appear in its parent _route.md's entries[]
+        for entry_path, entry_fm in {**self.entries, **self.recipes}.items():
             parent_route = entry_path.parent / "_route.md"
             if parent_route not in self.routes:
                 self.err(entry_path, f"parent folder has no _route.md at {parent_route}")
@@ -299,6 +405,8 @@ def main() -> int:
             continue
         if path.name == "_route.md":
             v.validate_route(path, fm)
+        elif fm.get("type") == "recipe":
+            v.validate_recipe(path, fm)
         else:
             v.validate_entry(path, fm)
 
@@ -316,7 +424,7 @@ def main() -> int:
         return 1
 
     if not args.quiet:
-        print(f"ok: {file_count} files, {len(v.routes)} routes, {len(v.entries)} entries — schema clean")
+        print(f"ok: {file_count} files, {len(v.routes)} routes, {len(v.entries)} entries, {len(v.recipes)} recipes — schema clean")
     return 0
 
 

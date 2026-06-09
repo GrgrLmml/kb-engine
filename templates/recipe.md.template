@@ -1,0 +1,30 @@
+---
+type: recipe
+id: {{slug}}
+title: {{title}}
+created: {{ISO8601_UTC}}
+updated: {{ISO8601_UTC}}
+status: active
+when_to_use: |
+  {{the trigger — the situation in which you'd reach for this procedure}}
+inputs: []
+tools: []
+topics: []
+steps:
+  - {{concise step 1}}
+  - {{concise step 2}}
+skill: null
+derived_from: []
+related: []
+sources: []
+supersedes: []
+superseded_by: null
+last_verified: null
+summary: |
+  {{two-paragraph WARM summary — what the procedure achieves and the shape of it}}
+---
+
+# {{title}}
+
+{{full step-by-step procedure: exact commands, queries, gotchas, output structure,
+and pointers to the skills/commands it composes. This body is the HOT payload.}}

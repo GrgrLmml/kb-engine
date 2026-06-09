@@ -46,15 +46,20 @@ Run any of these in a Claude Code session once installed:
 - `/file-this [hint]` — file the current conversation into the KB.
 - `/start <intent>` — bootstrap a session with relevant KB context.
 - `/promote <id>` — load an entry's full transcript (HOT tier).
-- `/split` · `/collapse` · `/dedup` · `/tidy` — librarian housekeeping passes.
+- `/extract-recipe [id|hint]` — distill a reusable procedure ("how we do X") into `kb:/recipes/`.
+- `/mine-recipes [kb:/folder]` — mine the KB for recurring procedures, propose them as draft recipes, flag skill-graduation candidates.
+- `/split` · `/collapse` · `/dedup` · `/tidy` — librarian housekeeping passes (`/tidy` also runs the recipe-mining pass).
 
 ## Layout
 
 - `commands/` — slash commands (symlinked into `~/.claude/commands` by install).
-- `librarian/` — the canonical filing/split/collapse/dedup procedures.
+- `librarian/` — the canonical filing/split/collapse/dedup/extract-recipe/mine-recipes procedures.
 - `scripts/` — `validate.py` (schema), `audit-topics.py` (topic normalization), `librarian` (headless).
 - `hooks/` — `normalize-topics.sh` (SessionEnd), `pre-commit` (validator), `session-end.sh` (legacy auto-file, off by default).
-- `docs/schema.md` — the frontmatter contract. Read it before editing KB files.
-- `templates/` — starter files for new entries, routes, and the topic vocabulary.
+- `docs/schema.md` — the frontmatter contract (leaf entries, recipes, routes). Read it before editing KB files.
+- `templates/` — starter files for new entries, recipes, routes, and the topic/tools vocabularies.
+
+Recipes (`type: recipe`, under `kb:/recipes/`) are evergreen reusable procedures distilled from
+conversations — see `docs/schema.md`. The `tools:` field is normalized against `kb-data/_tools.yaml`.
 
 See `README.md` for deeper detail on the architecture and the schema.

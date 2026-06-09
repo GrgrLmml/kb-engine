@@ -11,6 +11,7 @@ status: active
 supersedes: []
 superseded_by: null
 contradicts: []
+recipe_candidate: false
 decisions: []
 open_questions: []
 summary: |

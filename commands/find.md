@@ -25,6 +25,7 @@ Spawn an Explore subagent to do the actual search, so the main context stays cle
 >    - Title and summary similarity
 >    - Recency (newer wins ties)
 >    - Status (`active` only by default — skip `superseded` and `archived` unless the query asks for history)
+>    - **Recipes** (`type: recipe`, under `kb:/recipes/`) answer "how do we do X" rather than "what happened." For how-to / procedural queries, weight recipes higher and match the query against their `when_to_use` trigger. Label any recipe hit `[recipe]` in the output, and note `(draft)` if its status is draft.
 >
 > 4. **Expand along the curated typed edges.** This is the highest-signal step — these hand-maintained links carry meaning a keyword match cannot. For each top candidate, read its frontmatter edges and act on them:
 >    - **`superseded_by`** → the candidate is stale. Pull the superseder, prefer it, and mark the old one. **`supersedes`** → note what this entry replaced (offer it only if the query is historical).
