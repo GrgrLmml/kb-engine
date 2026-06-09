@@ -37,6 +37,7 @@ You may also be given an optional one-line hint about placement.
    - Use the entry template. Fill every field. Required: `id`, `title`, `created`, `updated`, `status`, `summary`. Empty arrays/`null` fine for the rest, but the keys must be present.
    - `id` = `<YYYY-MM-DD>-<slug>` (matches filename without extension).
    - `created` = current ISO 8601 UTC timestamp. `updated` = same.
+   - **Set `recipe_candidate`** (auto-flag for the recipe mining pass): `true` when this conversation looks like a *reusable procedure* — it composed **≥3 distinct tools/data sources** (DB, Jira, Slack, codebase, k8s, Datadog, the KB, web) AND reached a **repeatable** outcome (a method you'd run again), especially if it used words like recipe/playbook/runbook/recurring. A one-off investigation, a single decision, or a 1:1 note is `false`. This is a cheap hint, not a commitment — it just tells `/mine-recipes` where to look. Do NOT create the recipe here; `/extract-recipe` and the mining pass do that.
    - Below frontmatter, paste a faithful transcript of the conversation. Do not summarize the transcript — the `summary` field already does that. The transcript is the HOT-tier payload.
 
 4. **Update the parent `_route.md`.**
