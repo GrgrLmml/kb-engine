@@ -13,7 +13,7 @@ No re-explaining context. No "let me search your files for a few minutes". No st
 
 ![git clone, install.sh, then a Claude session recalling from the demo KB](demo/demo.gif)
 
-*The session above runs against a small fictional corpus (a side project, a collaborator, one recipe). Your KB starts empty — `install.sh` bootstraps it and the first `/file-this` plants the first entry.*
+*The session above runs against a small fictional corpus. Your KB starts empty — `install.sh` bootstraps it and the first `/file-this` plants the first entry.*
 
 ## Why not just CLAUDE.md, built-in memory, or SKILL.md files?
 
@@ -21,7 +21,7 @@ Those are great at what they do — kb-engine sits above them and fixes what the
 
 | | CLAUDE.md / auto-memory | static SKILL.md | **kb-engine** |
 |---|---|---|---|
-| Capacity | a few KB before it bloats every prompt | per-skill, hand-written | unbounded corpus; only a ~4k-token index rides along |
+| Capacity | a few KB before it bloats every prompt | per-skill | unbounded corpus; only a ~4k-token index rides along |
 | Structure | flat prose | flat prose | knowledge graph: folders + routes + typed edges (`related`, `supersedes`, `contradicts`) |
 | Retrieval | always-loaded or gone | trigger-phrase match | ranked BM25 search (SQLite FTS5, ms), typed-edge expansion, tiered loading |
 | Capture | passive, lossy | manual authoring | `/file-this` distills a whole conversation; `/jot` captures a fact in seconds |
