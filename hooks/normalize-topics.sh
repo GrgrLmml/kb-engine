@@ -47,7 +47,11 @@ else
   RUNNER=("$AUDIT" --fix)
 fi
 
-nohup bash -c '{ echo "# topic normalization — '"$STAMP"'"; echo; "$@"; } > "'"$LOG"'" 2>&1' _ "${RUNNER[@]}" \
+# After normalizing, refresh the search index so the next session's ambient
+# injection and kb search see whatever this session filed.
+KB_CLI="$KB_ENGINE_DIR/scripts/kb"
+export KB_DATA_DIR
+nohup bash -c '{ echo "# topic normalization — '"$STAMP"'"; echo; "$@"; [ -x "'"$KB_CLI"'" ] && "'"$KB_CLI"'" index; } > "'"$LOG"'" 2>&1' _ "${RUNNER[@]}" \
   </dev/null >/dev/null 2>&1 &
 disown
 

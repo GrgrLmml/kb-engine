@@ -22,7 +22,10 @@ KB_ENGINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLAUDE_DIR="$HOME/.claude"
 SETTINGS="$CLAUDE_DIR/settings.json"
 CMD_DIR="$CLAUDE_DIR/commands"
+SKILL_DIR="$CLAUDE_DIR/skills"
 HOOK="$KB_ENGINE_DIR/hooks/normalize-topics.sh"
+START_HOOK="$KB_ENGINE_DIR/hooks/session-start.sh"
+ALLOW_HOOK="$KB_ENGINE_DIR/hooks/allow-kb-query.sh"
 
 KB_DATA_DIR="$KB_ENGINE_DIR/kb-data"
 ASSUME_YES=0
@@ -56,22 +59,47 @@ if [ "$UNINSTALL" = 1 ]; then
       if [ -L "$link" ] && [ "$(readlink "$link")" = "$src" ]; then rm -f "$link"; ok "removed command $(basename "$src")"; fi
     done
   fi
+  for sk in "$KB_ENGINE_DIR"/skills/*/; do
+    name="$(basename "$sk")"
+    link="$SKILL_DIR/$name"
+    if [ -L "$link" ]; then rm -f "$link"; ok "removed skill $name"; fi
+  done
   if [ -f "$SETTINGS" ] && [ -n "$PY" ]; then
-    "$PY" - "$SETTINGS" "$HOOK" <<'PYEOF'
+    "$PY" - "$SETTINGS" "$KB_ENGINE_DIR" "$KB_DATA_DIR" "$HOOK" "$START_HOOK" "$ALLOW_HOOK" <<'PYEOF'
 import json, sys
-p, hook = sys.argv[1], sys.argv[2]
+p, mech, data, *ours = sys.argv[1:]
 d = json.load(open(p))
 d.get("env", {}).pop("KB_ENGINE_DIR", None)
 d.get("env", {}).pop("KB_DATA_DIR", None)
-se = d.get("hooks", {}).get("SessionEnd", [])
-for grp in se:
-    grp["hooks"] = [h for h in grp.get("hooks", []) if h.get("command") != hook]
-d.get("hooks", {})["SessionEnd"] = [g for g in se if g.get("hooks")]
-if not d.get("hooks", {}).get("SessionEnd"): d.get("hooks", {}).pop("SessionEnd", None)
+if d.get("env") == {}: d.pop("env", None)
+hooks = d.get("hooks", {})
+for event in ("SessionEnd", "SessionStart", "UserPromptSubmit", "PreToolUse"):
+    groups = hooks.get(event, [])
+    for grp in groups:
+        grp["hooks"] = [h for h in grp.get("hooks", []) if h.get("command") not in ours]
+    hooks[event] = [g for g in groups if g.get("hooks")]
+    if not hooks[event]: hooks.pop(event, None)
 if d.get("hooks") == {}: d.pop("hooks", None)
+perms = d.get("permissions", {})
+kb_rules = {
+    f"Bash({mech}/scripts/kb:*)",
+    "Bash($KB_ENGINE_DIR/scripts/kb:*)",
+    'Bash("$KB_ENGINE_DIR"/scripts/kb:*)',
+    f"Bash({mech}/scripts/validate.py:*)",
+    "Bash($KB_ENGINE_DIR/scripts/validate.py:*)",
+    f"Bash({mech}/scripts/audit-topics.py:*)",
+    "Bash($KB_ENGINE_DIR/scripts/audit-topics.py:*)",
+}
+if "allow" in perms:
+    perms["allow"] = [r for r in perms["allow"] if r not in kb_rules]
+    if not perms["allow"]: perms.pop("allow")
+if "additionalDirectories" in perms:
+    perms["additionalDirectories"] = [x for x in perms["additionalDirectories"] if x != data]
+    if not perms["additionalDirectories"]: perms.pop("additionalDirectories")
+if d.get("permissions") == {}: d.pop("permissions", None)
 json.dump(d, open(p, "w"), indent=2); open(p, "a").write("\n")
 PYEOF
-    ok "removed env vars + SessionEnd hook from settings.json"
+    ok "removed env vars, KB hooks + KB permission rules from settings.json"
   fi
   pc="$KB_DATA_DIR/.git/hooks/pre-commit"
   if [ -L "$pc" ]; then rm -f "$pc"; ok "removed pre-commit hook"; fi
@@ -133,9 +161,15 @@ fi
 if [ ! -d "$KB_DATA_DIR/.git" ]; then
   ( cd "$KB_DATA_DIR" && git init -q ) && ok "git-initialized kb-data" || warn "could not git init kb-data"
 fi
+GI="$KB_DATA_DIR/.gitignore"
+touch "$GI"
+for line in ".DS_Store" ".librarian.lock" ".librarian/log/" ".index/"; do
+  grep -qxF "$line" "$GI" || echo "$line" >> "$GI"
+done
+ok ".gitignore covers runtime artifacts (.index/, .librarian/)"
 echo
 
-# --- 3. command symlinks -------------------------------------------------
+# --- 3. command + skill symlinks ------------------------------------------
 echo "3. Slash commands → $CMD_DIR …"
 mkdir -p "$CMD_DIR"
 n=0
@@ -143,16 +177,25 @@ for src in "$KB_ENGINE_DIR"/commands/*.md; do
   ln -sf "$src" "$CMD_DIR/$(basename "$src")"; n=$((n+1))
 done
 ok "linked $n commands"
+mkdir -p "$SKILL_DIR"
+for sk in "$KB_ENGINE_DIR"/skills/*/; do
+  name="$(basename "$sk")"
+  ln -sfn "${sk%/}" "$SKILL_DIR/$name"
+  ok "linked skill $name"
+done
 echo
 
-# --- 4. settings.json (env + hook) ---------------------------------------
-echo "4. ~/.claude/settings.json (env vars + SessionEnd hook)…"
+# --- 4. settings.json (env + hooks) ---------------------------------------
+echo "4. ~/.claude/settings.json (env vars + SessionEnd/SessionStart hooks)…"
 if [ -z "$PY" ]; then warn "python3 unavailable — skipping settings edit; set KB_ENGINE_DIR/KB_DATA_DIR yourself"; else
   do_it=1
   if [ "$ASSUME_YES" != 1 ]; then
     if [ -t 0 ]; then
-      say "Will set env.KB_ENGINE_DIR, env.KB_DATA_DIR and register the SessionEnd"
-      say "topic-normalization hook in $SETTINGS (existing keys preserved)."
+      say "Will set env.KB_ENGINE_DIR, env.KB_DATA_DIR, register the SessionEnd"
+      say "topic-normalization hook, the SessionStart ambient-index hook, the"
+      say "PreToolUse permission hook (auto-allows read-only kb queries), AND"
+      say "permission allow rules for the kb scripts + kb-data as an additional"
+      say "working directory in $SETTINGS (existing keys preserved)."
       printf "  Proceed? [y/N] "; read -r ans; [ "$ans" = y ] || [ "$ans" = Y ] || do_it=0
     else
       do_it=0; warn "non-interactive and no --yes; skipping settings edit (re-run with --yes)"
@@ -160,17 +203,43 @@ if [ -z "$PY" ]; then warn "python3 unavailable — skipping settings edit; set 
   fi
   if [ "$do_it" = 1 ]; then
     mkdir -p "$CLAUDE_DIR"; [ -f "$SETTINGS" ] || echo '{}' > "$SETTINGS"
-    "$PY" - "$SETTINGS" "$KB_ENGINE_DIR" "$KB_DATA_DIR" "$HOOK" <<'PYEOF'
+    "$PY" - "$SETTINGS" "$KB_ENGINE_DIR" "$KB_DATA_DIR" "$HOOK" "$START_HOOK" "$ALLOW_HOOK" <<'PYEOF'
 import json, sys
-p, mech, data, hook = sys.argv[1:5]
+p, mech, data, hook, start_hook, allow_hook = sys.argv[1:7]
 d = json.load(open(p))
 d.setdefault("env", {})["KB_ENGINE_DIR"] = mech
 d["env"]["KB_DATA_DIR"] = data
 hooks = d.setdefault("hooks", {})
 se = hooks.setdefault("SessionEnd", [])
-present = any(h.get("command") == hook for g in se for h in g.get("hooks", []))
-if not present:
+if not any(h.get("command") == hook for g in se for h in g.get("hooks", [])):
     se.append({"hooks": [{"type": "command", "command": hook, "async": True, "timeout": 30}]})
+ss = hooks.setdefault("SessionStart", [])
+if not any(h.get("command") == start_hook for g in ss for h in g.get("hooks", [])):
+    # matcher: only fresh contexts — a resumed session already has the index
+    ss.append({"matcher": "startup|clear",
+               "hooks": [{"type": "command", "command": start_hook, "timeout": 30}]})
+pt = hooks.setdefault("PreToolUse", [])
+if not any(h.get("command") == allow_hook for g in pt for h in g.get("hooks", [])):
+    # auto-allow read-only kb queries — plain allow rules can't match commands
+    # containing $KB_ENGINE_DIR (the expansion heuristic forces a prompt)
+    pt.append({"matcher": "Bash",
+               "hooks": [{"type": "command", "command": allow_hook, "timeout": 10}]})
+perms = d.setdefault("permissions", {})
+allow = perms.setdefault("allow", [])
+for rule in (
+    f"Bash({mech}/scripts/kb:*)",
+    "Bash($KB_ENGINE_DIR/scripts/kb:*)",
+    'Bash("$KB_ENGINE_DIR"/scripts/kb:*)',
+    f"Bash({mech}/scripts/validate.py:*)",
+    "Bash($KB_ENGINE_DIR/scripts/validate.py:*)",
+    f"Bash({mech}/scripts/audit-topics.py:*)",
+    "Bash($KB_ENGINE_DIR/scripts/audit-topics.py:*)",
+):
+    if rule not in allow:
+        allow.append(rule)
+dirs = perms.setdefault("additionalDirectories", [])
+if data not in dirs:
+    dirs.append(data)
 json.dump(d, open(p, "w"), indent=2); open(p, "a").write("\n")
 PYEOF
     ok "settings.json updated"
@@ -188,4 +257,14 @@ else
 fi
 echo
 
-echo "Done. Open a new Claude Code session (or run /hooks to reload) and try: /load-kb"
+# --- 6. search index ------------------------------------------------------
+echo "6. Search index…"
+if KB_DATA_DIR="$KB_DATA_DIR" "$KB_ENGINE_DIR/scripts/kb" index 2>/dev/null; then
+  ok "FTS index built ($KB_DATA_DIR/.index/kb.db)"
+else
+  warn "index build failed — it will self-build on first 'kb search'"
+fi
+echo
+
+echo "Done. Open a new Claude Code session (or run /hooks to reload) and try: /find <something>"
+echo "The compact KB index is now injected into every new session (pause: touch \$KB_DATA_DIR/.no-ambient)."
