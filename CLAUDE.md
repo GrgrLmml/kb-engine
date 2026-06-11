@@ -37,13 +37,28 @@ Scripts and hooks also self-resolve these from their own location if the env var
 absent (e.g. the git pre-commit hook, which runs outside a Claude session). So nothing
 is hardcoded to one machine.
 
+## The `kb` CLI (use it — don't traverse by hand)
+
+`$KB_ENGINE_DIR/scripts/kb` is the deterministic core. When working **on this repo or
+with the KB**, prefer it over manual find/grep pipelines:
+
+- `kb search <terms>` — ranked BM25 search (self-refreshing index). `--type recipe`, `--topic`, `--person`, `--all-status`, `--json`.
+- `kb show <id>` / `kb show --path <id>` — resolve any id / `kb:/` URI / path.
+- `kb edges <id>` — typed edges, forward and reverse.
+- `kb routes [--compact|--deep]` — the route layer + BASELINE size metrics.
+- `kb sync` — after writing any leaf: regenerates route `entries[]`/`subroutes[]`/`last_indexed`, normalizes topics, refreshes the index. Never hand-edit those route fields.
+- `kb doctor` — broken refs, stale recipes, route drift.
+
+A compact KB index is auto-injected into new sessions as `<kb-ambient-index>` (SessionStart hook). The `kb-recall` skill reaches into the KB proactively.
+
 ## Commands
 
 Run any of these in a Claude Code session once installed:
 
-- `/find <query>` — search the KB; pulls best matches to WARM tier, follows curated edges.
+- `/find <query>` — ranked search; pulls best matches to WARM tier, follows curated edges.
 - `/load-kb [--deep] [query]` — load the whole index into context (high-recall baseline).
 - `/file-this [hint]` — file the current conversation into the KB.
+- `/jot <fact>` — capture a small durable fact in seconds (minimal leaf, no transcript).
 - `/start <intent>` — bootstrap a session with relevant KB context.
 - `/promote <id>` — load an entry's full transcript (HOT tier).
 - `/extract-recipe [id|hint]` — distill a reusable procedure ("how we do X") into `kb:/recipes/`.
@@ -53,10 +68,12 @@ Run any of these in a Claude Code session once installed:
 ## Layout
 
 - `commands/` — slash commands (symlinked into `~/.claude/commands` by install).
+- `skills/` — proactive skills (`kb-recall`), symlinked into `~/.claude/skills` by install.
 - `librarian/` — the canonical filing/split/collapse/dedup/extract-recipe/mine-recipes procedures.
-- `scripts/` — `validate.py` (schema), `audit-topics.py` (topic normalization), `librarian` (headless).
-- `hooks/` — `normalize-topics.sh` (SessionEnd), `pre-commit` (validator), `session-end.sh` (legacy auto-file, off by default).
+- `scripts/` — `kb` (deterministic CLI: search/show/edges/routes/sync/doctor), `validate.py` (schema), `audit-topics.py` (topic normalization), `librarian` (headless).
+- `hooks/` — `session-start.sh` (ambient index), `normalize-topics.sh` (SessionEnd sweep + index refresh), `auto-recall.sh` (experimental, NOT registered by default), `pre-commit` (validator), `session-end.sh` (legacy auto-file, off by default).
 - `docs/schema.md` — the frontmatter contract (leaf entries, recipes, routes). Read it before editing KB files.
+- `docs/plan-day2.md` — the day-2 maturity plan (phases 1–3 shipped; phase 4 trigger-gated).
 - `templates/` — starter files for new entries, recipes, routes, and the topic/tools vocabularies.
 
 Recipes (`type: recipe`, under `kb:/recipes/`) are evergreen reusable procedures distilled from

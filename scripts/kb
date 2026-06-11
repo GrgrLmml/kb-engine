@@ -1,0 +1,739 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["pyyaml>=6"]
+# ///
+"""kb — deterministic primitives for Gregor's knowledge base.
+
+The LLM layer (slash commands, skills) calls these instead of traversing or
+bookkeeping by hand. Everything mechanical lives here; judgment stays with the
+model.
+
+Subcommands:
+  index            build/refresh the SQLite FTS5 search index (incremental, by mtime)
+  search QUERY     BM25-ranked full-text search over frontmatter + body
+  show ID|URI|PATH resolve an entry and print it (--path: print the path only)
+  edges ID         resolved typed edges, forward AND reverse ("what links here")
+  routes           emit the route layer (+ BASELINE metrics); --compact / --deep
+  reindex-routes   regenerate entries[]/subroutes/last_indexed in every _route.md
+                   from the leaves (purpose/related/prose stay hand-curated)
+  sync             reindex-routes + audit-topics --fix + index  (post-filing one-liner)
+  doctor           staleness + referential-integrity report
+
+The index lives at $KB_DATA_DIR/.index/kb.db (gitignored, disposable — rebuilt
+from the markdown at any time).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import yaml
+
+
+# --------------------------------------------------------------------- paths
+
+def kb_root() -> Path:
+    root = os.environ.get("KB_DATA_DIR") or str(
+        Path(__file__).resolve().parent.parent / "kb-data")
+    p = Path(root)
+    if not p.exists():
+        sys.exit(f"kb: KB_DATA_DIR does not exist: {p}")
+    return p
+
+
+def engine_dir() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def db_path(root: Path) -> Path:
+    d = root / ".index"
+    d.mkdir(exist_ok=True)
+    return d / "kb.db"
+
+
+def to_kb_uri(root: Path, p: Path) -> str:
+    return "kb:/" if p == root else "kb:/" + str(p.relative_to(root))
+
+
+def from_kb_uri(root: Path, uri: str) -> Path:
+    rel = uri[len("kb:/"):]
+    return root if rel == "" else root / rel
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# --------------------------------------------------------------- frontmatter
+
+class StrLoader(yaml.SafeLoader):
+    """SafeLoader that keeps ISO timestamps as strings."""
+
+
+StrLoader.yaml_implicit_resolvers = {
+    k: [(tag, rx) for (tag, rx) in resolvers if tag != "tag:yaml.org,2002:timestamp"]
+    for k, resolvers in StrLoader.yaml_implicit_resolvers.items()
+}
+
+
+def parse_fm(path: Path) -> tuple[dict | None, str]:
+    """Return (frontmatter dict or None, body text)."""
+    try:
+        text = path.read_text()
+    except Exception:
+        return None, ""
+    if not text.startswith("---\n"):
+        return None, text
+    try:
+        end = text.index("\n---\n", 4)
+    except ValueError:
+        return None, text
+    try:
+        fm = yaml.load(text[4:end], Loader=StrLoader)
+    except yaml.YAMLError:
+        return None, text
+    if not isinstance(fm, dict):
+        return None, text
+    return fm, text[end + 5:]
+
+
+def _hidden(root: Path, p: Path) -> bool:
+    return any(part.startswith(".") for part in p.relative_to(root).parts)
+
+
+def walk_md(root: Path):
+    for p in sorted(root.rglob("*.md")):
+        if not _hidden(root, p):
+            yield p
+
+
+def first_line(s: object, limit: int = 200) -> str:
+    """First paragraph, collapsed to one line, truncated."""
+    if not isinstance(s, str) or not s.strip():
+        return ""
+    para = s.strip().split("\n\n")[0]
+    line = " ".join(part.strip() for part in para.splitlines())
+    return line if len(line) <= limit else line[: limit - 1] + "…"
+
+
+# --------------------------------------------------------------------- index
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (
+  path TEXT PRIMARY KEY,        -- kb:/ URI
+  mtime REAL NOT NULL,
+  id TEXT,
+  doctype TEXT NOT NULL,        -- entry | recipe | route
+  status TEXT,
+  title TEXT,
+  created TEXT,
+  updated TEXT,
+  topics TEXT,                  -- comma-joined
+  participants TEXT
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(
+  id, title, topics, participants, summary, extra, body, path UNINDEXED,
+  tokenize = 'unicode61'
+);
+CREATE TABLE IF NOT EXISTS edges (
+  src TEXT NOT NULL,            -- source id
+  kind TEXT NOT NULL,           -- related|supersedes|superseded_by|contradicts|derived_from
+  target TEXT NOT NULL,         -- bare id, or kb:/ URI for related
+  PRIMARY KEY (src, kind, target)
+);
+"""
+
+
+def open_db(root: Path) -> sqlite3.Connection:
+    con = sqlite3.connect(db_path(root))
+    con.executescript(SCHEMA)
+    return con
+
+
+def doc_fields(fm: dict, body: str, doctype: str) -> dict:
+    """Flatten frontmatter into the FTS columns."""
+    lst = lambda k: [str(x) for x in (fm.get(k) or []) if x is not None]
+    extra_parts: list[str] = []
+    for k in ("when_to_use", "purpose"):
+        if isinstance(fm.get(k), str):
+            extra_parts.append(fm[k])
+    for k in ("steps", "decisions", "open_questions", "tools", "inputs"):
+        extra_parts.extend(lst(k))
+    if doctype == "route":
+        for sub in fm.get("subroutes") or []:
+            if isinstance(sub, dict):
+                extra_parts.append(str(sub.get("summary") or ""))
+        for ent in fm.get("entries") or []:
+            if isinstance(ent, dict):
+                extra_parts.append(str(ent.get("summary") or ""))
+    return {
+        "id": str(fm.get("id") or ""),
+        "title": str(fm.get("title") or ""),
+        "topics": ", ".join(lst("topics")),
+        "participants": ", ".join(lst("participants")),
+        "summary": str(fm.get("summary") or ""),
+        "extra": "\n".join(p for p in extra_parts if p),
+        "body": body,
+    }
+
+
+def index_edges(con: sqlite3.Connection, fm: dict) -> None:
+    src = fm.get("id")
+    if not src:
+        return
+    con.execute("DELETE FROM edges WHERE src = ?", (src,))
+    for kind in ("related", "supersedes", "contradicts", "derived_from"):
+        for t in fm.get(kind) or []:
+            if isinstance(t, str):
+                con.execute("INSERT OR IGNORE INTO edges VALUES (?,?,?)", (src, kind, t))
+    sb = fm.get("superseded_by")
+    if isinstance(sb, str):
+        con.execute("INSERT OR IGNORE INTO edges VALUES (?,?,?)", (src, "superseded_by", sb))
+
+
+def cmd_index(args) -> int:
+    root = kb_root()
+    con = open_db(root)
+    known = {p: m for p, m in con.execute("SELECT path, mtime FROM meta")}
+    if args.rebuild:
+        con.execute("DELETE FROM meta")
+        con.execute("DELETE FROM docs")
+        con.execute("DELETE FROM edges")
+        known = {}
+    seen, added, refreshed = set(), 0, 0
+    for path in walk_md(root):
+        uri = to_kb_uri(root, path)
+        seen.add(uri)
+        mtime = path.stat().st_mtime
+        if uri in known and known[uri] == mtime:
+            continue
+        fm, body = parse_fm(path)
+        if fm is None:
+            continue  # invalid files are the validator's problem, not the index's
+        doctype = ("route" if path.name == "_route.md"
+                   else "recipe" if fm.get("type") == "recipe" else "entry")
+        d = doc_fields(fm, body, doctype)
+        con.execute("DELETE FROM docs WHERE path = ?", (uri,))
+        con.execute(
+            "INSERT INTO docs (id,title,topics,participants,summary,extra,body,path) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (d["id"], d["title"], d["topics"], d["participants"],
+             d["summary"], d["extra"], d["body"], uri))
+        con.execute(
+            "INSERT OR REPLACE INTO meta VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (uri, mtime, d["id"] or None, doctype, fm.get("status"),
+             d["title"], fm.get("created"), fm.get("updated"),
+             d["topics"], d["participants"]))
+        index_edges(con, fm)
+        refreshed += 1 if uri in known else 0
+        added += 0 if uri in known else 1
+    gone = set(known) - seen
+    for uri in gone:
+        con.execute("DELETE FROM meta WHERE path = ?", (uri,))
+        con.execute("DELETE FROM docs WHERE path = ?", (uri,))
+    con.commit()
+    n = con.execute("SELECT count(*) FROM meta").fetchone()[0]
+    if not args.quiet:
+        print(f"kb index: {n} docs ({added} added, {refreshed} refreshed, {len(gone)} removed)")
+    return 0
+
+
+def ensure_index(root: Path) -> sqlite3.Connection:
+    """Open the db, refreshing it first so results are never stale."""
+
+    class _A:
+        rebuild = False
+        quiet = True
+
+    cmd_index(_A())
+    return open_db(root)
+
+
+# -------------------------------------------------------------------- search
+
+def fts_query(raw: str) -> str:
+    toks = re.findall(r"[A-Za-z0-9_]+", raw)
+    if not toks:
+        sys.exit("kb search: query has no searchable tokens")
+    return " OR ".join(f'"{t}"' for t in toks)
+
+
+# column weights: id, title, topics, participants, summary, extra, body, path
+BM25_WEIGHTS = "4.0, 8.0, 6.0, 3.0, 5.0, 4.0, 1.0, 0.0"
+
+
+def cmd_search(args) -> int:
+    root = kb_root()
+    con = ensure_index(root)
+    sql = (f"SELECT m.id, m.path, m.doctype, m.status, m.title, m.created, m.topics, "
+           f"bm25(docs, {BM25_WEIGHTS}) AS score, docs.summary "
+           f"FROM docs JOIN meta m ON m.path = docs.path "
+           f"WHERE docs MATCH ?")
+    params: list[object] = [fts_query(" ".join(args.query))]
+    if args.type != "all":
+        sql += " AND m.doctype = ?"
+        params.append(args.type)
+    elif not args.routes:
+        sql += " AND m.doctype != 'route'"
+    if not args.all_status:
+        sql += " AND (m.status IN ('active','draft') OR m.status IS NULL)"
+    for t in args.topic or []:
+        sql += " AND (',' || replace(m.topics, ' ', '') || ',') LIKE ?"
+        params.append(f"%,{t},%")
+    for p in args.person or []:
+        sql += " AND (',' || replace(m.participants, ' ', '') || ',') LIKE ?"
+        params.append(f"%,{p},%")
+    sql += " ORDER BY score LIMIT ?"
+    params.append(args.n)
+    rows = con.execute(sql, params).fetchall()
+    if args.json:
+        out = [{"id": r[0], "path": str(from_kb_uri(root, r[1])), "kb_path": r[1],
+                "type": r[2], "status": r[3], "title": r[4], "created": r[5],
+                "topics": r[6], "score": round(-r[7], 3), "summary": first_line(r[8])}
+               for r in rows]
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        return 0
+    if not rows:
+        print("no hits")
+        return 1
+    for r in rows:
+        rid, uri, doctype, status, title, created, topics, score, summary = r
+        label = doctype + ("" if status in (None, "active") else f", {status}")
+        print(f"[{-score:6.2f}] {rid or uri}  ({label})")
+        print(f"         file: {from_kb_uri(root, uri)}")
+        print(f"         title: {title}" + (f"  ({created[:10]})" if created else ""))
+        if topics:
+            print(f"         topics: {topics}")
+        if summary:
+            print(f"         summary: {first_line(summary)}")
+    return 0
+
+
+# ---------------------------------------------------------------------- show
+
+def resolve(root: Path, ref: str) -> Path:
+    if ref.startswith("kb:/"):
+        p = from_kb_uri(root, ref)
+        if p.is_file():
+            return p
+        sys.exit(f"kb: no file at {ref}")
+    p = Path(ref)
+    if p.is_file():
+        return p
+    # bare id — try the index first, fall back to a filesystem scan
+    con = open_db(root)
+    row = con.execute("SELECT path FROM meta WHERE id = ?", (ref,)).fetchone()
+    if row:
+        f = from_kb_uri(root, row[0])
+        if f.is_file():
+            return f
+    hits = [f for f in walk_md(root)
+            if (parse_fm(f)[0] or {}).get("id") == ref]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        sys.exit(f"kb: no entry with id '{ref}'")
+    sys.exit("kb: ambiguous id, candidates:\n" + "\n".join(str(h) for h in hits))
+
+
+def cmd_show(args) -> int:
+    root = kb_root()
+    p = resolve(root, args.ref)
+    if args.path:
+        print(p)
+    else:
+        print(p.read_text(), end="")
+    return 0
+
+
+# --------------------------------------------------------------------- edges
+
+def cmd_edges(args) -> int:
+    root = kb_root()
+    con = ensure_index(root)
+
+    def describe(target: str) -> str:
+        if target.startswith("kb:/"):
+            row = con.execute("SELECT title, status FROM meta WHERE path = ?",
+                              (target,)).fetchone()
+        else:
+            row = con.execute("SELECT title, status FROM meta WHERE id = ?",
+                              (target,)).fetchone()
+        if not row:
+            return f"{target}  (MISSING)"
+        title, status = row
+        tag = "" if status in (None, "active") else f" [{status}]"
+        return f"{target}  — {title}{tag}"
+
+    rid = args.id
+    fwd = con.execute("SELECT kind, target FROM edges WHERE src = ? ORDER BY kind",
+                      (rid,)).fetchall()
+    rev = con.execute(
+        "SELECT kind, src FROM edges WHERE target = ? OR target = "
+        "(SELECT path FROM meta WHERE id = ?) ORDER BY kind", (rid, rid)).fetchall()
+    if not fwd and not rev:
+        print(f"no edges for '{rid}'")
+        return 0
+    if fwd:
+        print("forward:")
+        for kind, target in fwd:
+            print(f"  {kind:>14}: {describe(target)}")
+    if rev:
+        print("reverse (what links here):")
+        for kind, src in rev:
+            print(f"  {kind:>14}: {describe(src)}")
+    return 0
+
+
+# -------------------------------------------------------------------- routes
+
+def cmd_routes(args) -> int:
+    root = kb_root()
+    routes = [p for p in walk_md(root) if p.name == "_route.md"]
+    nentries = 0
+    chars = 0
+
+    if args.compact:
+        out: list[str] = []
+        for rp in routes:
+            fm, _ = parse_fm(rp)
+            if fm is None:
+                continue
+            folder = fm.get("folder", to_kb_uri(root, rp.parent))
+            out.append(f"{folder} — {first_line(fm.get('purpose'), 150)}")
+            for ent in fm.get("entries") or []:
+                if not isinstance(ent, dict):
+                    continue
+                nentries += 1
+                out.append(f"  {ent.get('id')} — {first_line(ent.get('summary'), 120)}")
+            out.append("")
+        # recipes get their trigger line too — that's what /start matches on
+        rec_dir = root / "recipes"
+        if rec_dir.is_dir():
+            out.append("recipe triggers (when_to_use):")
+            for p in sorted(rec_dir.glob("*.md")):
+                if p.name == "_route.md":
+                    continue
+                fm, _ = parse_fm(p)
+                if fm and fm.get("type") == "recipe":
+                    tag = "" if fm.get("status") == "active" else f" [{fm.get('status')}]"
+                    out.append(f"  {fm.get('id')}{tag}: {first_line(fm.get('when_to_use'), 150)}")
+        text = "\n".join(out)
+        print(text)
+        chars = len(text)
+        print(f"\nBASELINE: level=compact routes={len(routes)} entries={nentries} "
+              f"chars={chars} est_tokens={chars // 4}")
+        return 0
+
+    for rp in routes:
+        text = rp.read_text()
+        chars += len(text)
+        print(f"===== {to_kb_uri(root, rp)} =====")
+        print(text)
+        nentries += len(re.findall(r"^\s*- id:", text, re.M))
+
+    if args.deep:
+        nleaves = 0
+        for p in walk_md(root):
+            if p.name == "_route.md":
+                continue
+            text = p.read_text()
+            end = text.index("\n---\n", 4) + 5 if text.startswith("---\n") and "\n---\n" in text else len(text)
+            fm_text = text[:end]
+            chars += len(fm_text)
+            nleaves += 1
+            print(f"===== {to_kb_uri(root, p)} =====")
+            print(fm_text)
+        print(f"BASELINE: level=deep routes={len(routes)} entries={nentries} "
+              f"leaves={nleaves} chars={chars} est_tokens={chars // 4}")
+    else:
+        print(f"BASELINE: level=route routes={len(routes)} entries={nentries} "
+              f"chars={chars} est_tokens={chars // 4}")
+    return 0
+
+
+# ------------------------------------------------------------ reindex-routes
+
+def ydump(v: object) -> str:
+    """One-line YAML scalar."""
+    s = yaml.safe_dump(v, default_flow_style=True, allow_unicode=True,
+                       width=10 ** 6).strip()
+    if s.endswith("\n..."):
+        s = s[: -4].strip()
+    return s
+
+
+def yflow(items: list) -> str:
+    return "[" + ", ".join(ydump(i) for i in items) + "]"
+
+
+def emit_route(fm: dict, body: str) -> str:
+    lines = ["---", "type: route",
+             f"folder: {fm['folder']}",
+             f"title: {ydump(fm.get('title') or '')}",
+             f"purpose: {ydump(fm.get('purpose') or '')}",
+             f"last_indexed: {fm['last_indexed']}",
+             f"topics: {yflow(fm.get('topics') or [])}"]
+    subs = fm.get("subroutes") or []
+    lines.append("subroutes:" if subs else "subroutes: []")
+    for s in subs:
+        lines.append(f"  - path: {s['path']}")
+        lines.append(f"    summary: {ydump(s.get('summary') or '')}")
+    ents = fm.get("entries") or []
+    lines.append("entries:" if ents else "entries: []")
+    for e in ents:
+        lines.append(f"  - id: {e['id']}")
+        lines.append(f"    file: {e['file']}")
+        lines.append(f"    summary: {ydump(e.get('summary') or '')}")
+    rel = fm.get("related") or []
+    lines.append("related:" if rel else "related: []")
+    for r in rel:
+        lines.append(f"  - {r}")
+    lines.append("---")
+    return "\n".join(lines) + "\n" + body
+
+
+def cmd_reindex_routes(args) -> int:
+    root = kb_root()
+    now = now_iso()
+    changed = 0
+    for rp in [p for p in walk_md(root) if p.name == "_route.md"]:
+        fm, body = parse_fm(rp)
+        if fm is None:
+            print(f"kb reindex-routes: SKIP unparseable {rp}", file=sys.stderr)
+            continue
+        folder = rp.parent
+        fm["folder"] = to_kb_uri(root, folder)
+
+        # --- entries[]: derived from the leaves actually on disk -------------
+        old_entries = {e.get("id"): e for e in (fm.get("entries") or [])
+                       if isinstance(e, dict)}
+        new_entries = []
+        leaf_topics: list[list[str]] = []
+        for leaf in sorted(folder.glob("*.md")):
+            if leaf.name == "_route.md":
+                continue
+            lfm, _ = parse_fm(leaf)
+            if lfm is None or not lfm.get("id"):
+                continue
+            lid = lfm["id"]
+            prev = old_entries.get(lid)
+            # keep the (possibly curated) one-liner; derive one for new leaves
+            summary = (prev or {}).get("summary") or first_line(lfm.get("summary"), 100)
+            new_entries.append({"id": lid, "file": to_kb_uri(root, leaf),
+                                "summary": summary})
+            leaf_topics.append([str(t) for t in (lfm.get("topics") or [])])
+        # preserve curated order for kept ids, append new ones (sorted) at the end
+        kept = [e for e in (fm.get("entries") or [])
+                if isinstance(e, dict) and any(n["id"] == e.get("id") for n in new_entries)]
+        kept_ids = {e.get("id") for e in kept}
+        ordered = [next(n for n in new_entries if n["id"] == e.get("id")) for e in kept]
+        ordered += [n for n in new_entries if n["id"] not in kept_ids]
+
+        # --- subroutes: every child dir present, curated summaries kept ------
+        old_subs = {s.get("path"): s for s in (fm.get("subroutes") or [])
+                    if isinstance(s, dict)}
+        found_subs = {}
+        for child in sorted(p for p in folder.iterdir()
+                            if p.is_dir() and not p.name.startswith(".")):
+            child_route = child / "_route.md"
+            if not child_route.is_file():
+                continue
+            uri = to_kb_uri(root, child_route)
+            prev = old_subs.get(uri)
+            if prev and prev.get("summary"):
+                summary = prev["summary"]
+            else:
+                cfm, _ = parse_fm(child_route)
+                summary = first_line((cfm or {}).get("purpose"), 100) or child.name
+            found_subs[uri] = {"path": uri, "summary": summary}
+        # curated order for kept paths, new children appended (sorted)
+        new_subs = [found_subs[s["path"]] for s in (fm.get("subroutes") or [])
+                    if isinstance(s, dict) and s.get("path") in found_subs]
+        new_subs += [v for k, v in found_subs.items()
+                     if k not in {s["path"] for s in new_subs}]
+
+        # --- topics: keep existing; add tags shared by >=2 direct leaves -----
+        topics = [str(t) for t in (fm.get("topics") or [])]
+        counts: dict[str, int] = {}
+        for ts in leaf_topics:
+            for t in set(ts):
+                counts[t] = counts.get(t, 0) + 1
+        for t, c in sorted(counts.items()):
+            if c >= 2 and t not in topics:
+                topics.append(t)
+
+        new_fm = dict(fm)
+        new_fm.update(entries=ordered, subroutes=new_subs, topics=topics)
+        dirty = (ordered != (fm.get("entries") or [])
+                 or new_subs != (fm.get("subroutes") or [])
+                 or topics != [str(t) for t in (fm.get("topics") or [])]
+                 or fm.get("folder") != new_fm["folder"])
+        new_fm["last_indexed"] = now if dirty else fm.get("last_indexed") or now
+        out = emit_route(new_fm, body)
+        if out != rp.read_text():
+            changed += 1
+            if args.dry_run:
+                print(f"would rewrite {to_kb_uri(root, rp)}")
+            else:
+                rp.write_text(out)
+    verb = "would rewrite" if args.dry_run else "rewrote"
+    print(f"kb reindex-routes: {verb} {changed} route file(s)")
+    return 0
+
+
+# ---------------------------------------------------------------------- sync
+
+def cmd_sync(args) -> int:
+    rc = cmd_reindex_routes(argparse.Namespace(dry_run=False))
+    audit = engine_dir() / "scripts" / "audit-topics.py"
+    if audit.exists():
+        r = subprocess.run(["uv", "run", "--quiet", str(audit), "--fix"],
+                           capture_output=True, text=True)
+        tail = (r.stdout or "").strip().splitlines()
+        if tail:
+            print(tail[-1])
+    cmd_index(argparse.Namespace(rebuild=False, quiet=args.quiet))
+    return rc
+
+
+# -------------------------------------------------------------------- doctor
+
+def cmd_doctor(args) -> int:
+    root = kb_root()
+    con = ensure_index(root)
+    problems = 0
+
+    def report(kind: str, msg: str):
+        nonlocal problems
+        problems += 1
+        print(f"  {kind:<12} {msg}")
+
+    print("kb doctor:")
+    ids = {r[0] for r in con.execute("SELECT id FROM meta WHERE id IS NOT NULL")}
+    # broken bare-id references
+    for src, kind, target in con.execute(
+            "SELECT src, kind, target FROM edges WHERE kind != 'related'"):
+        if target not in ids:
+            report("broken-ref", f"{src} {kind} -> '{target}' (no such id)")
+    # broken kb:/ related links
+    for src, kind, target in con.execute(
+            "SELECT src, kind, target FROM edges WHERE kind = 'related'"):
+        if target.startswith("kb:/") and not from_kb_uri(root, target).exists():
+            report("broken-link", f"{src} related -> {target} (missing on disk)")
+    # recipe staleness
+    now = datetime.now(timezone.utc)
+    for p in walk_md(root):
+        fm, _ = parse_fm(p)
+        if not fm or fm.get("type") != "recipe":
+            continue
+        rid = fm.get("id")
+        lv = fm.get("last_verified")
+        if fm.get("status") == "draft":
+            created = fm.get("created") or ""
+            try:
+                age = (now - datetime.strptime(created, "%Y-%m-%dT%H:%M:%SZ")
+                       .replace(tzinfo=timezone.utc)).days
+            except ValueError:
+                age = -1
+            if age > 30:
+                report("stale-draft", f"{rid} has been draft for {age}d — verify or drop")
+        elif lv is None:
+            report("unverified", f"{rid} active but last_verified is null")
+        else:
+            try:
+                age = (now - datetime.strptime(lv, "%Y-%m-%dT%H:%M:%SZ")
+                       .replace(tzinfo=timezone.utc)).days
+                if age > args.recipe_max_age:
+                    report("stale-recipe", f"{rid} last verified {age}d ago")
+            except ValueError:
+                report("bad-date", f"{rid} last_verified unparseable: {lv!r}")
+    # route drift: leaf on disk newer than its route's last_indexed
+    for rp in [p for p in walk_md(root) if p.name == "_route.md"]:
+        fm, _ = parse_fm(rp)
+        if not fm:
+            continue
+        listed = {e.get("id") for e in (fm.get("entries") or []) if isinstance(e, dict)}
+        on_disk = set()
+        for leaf in rp.parent.glob("*.md"):
+            if leaf.name == "_route.md":
+                continue
+            lfm, _ = parse_fm(leaf)
+            if lfm and lfm.get("id"):
+                on_disk.add(lfm["id"])
+        if listed != on_disk:
+            report("route-drift",
+                   f"{to_kb_uri(root, rp)} entries[] != leaves on disk — run `kb sync`")
+    if problems == 0:
+        print("  all clear")
+    return 1 if problems else 0
+
+
+# ---------------------------------------------------------------------- main
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="kb", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("index", help="build/refresh the search index")
+    p.add_argument("--rebuild", action="store_true")
+    p.add_argument("--quiet", action="store_true")
+    p.set_defaults(fn=cmd_index)
+
+    p = sub.add_parser("search", help="BM25 full-text search")
+    p.add_argument("query", nargs="+")
+    p.add_argument("-n", type=int, default=10, help="max hits (default 10)")
+    p.add_argument("--type", choices=["entry", "recipe", "route", "all"], default="all")
+    p.add_argument("--topic", action="append", help="require a topic tag (repeatable)")
+    p.add_argument("--person", action="append", help="require a participant (repeatable)")
+    p.add_argument("--all-status", action="store_true",
+                   help="include superseded/archived")
+    p.add_argument("--routes", action="store_true", help="include _route.md hits")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_search)
+
+    p = sub.add_parser("show", help="resolve an id / kb:/ URI / path and print it")
+    p.add_argument("ref")
+    p.add_argument("--path", action="store_true", help="print the resolved path only")
+    p.set_defaults(fn=cmd_show)
+
+    p = sub.add_parser("edges", help="typed edges for an id, forward and reverse")
+    p.add_argument("id")
+    p.set_defaults(fn=cmd_edges)
+
+    p = sub.add_parser("routes", help="emit the route layer + BASELINE metrics")
+    p.add_argument("--compact", action="store_true",
+                   help="distilled one-line-per-entry index (for ambient injection)")
+    p.add_argument("--deep", action="store_true",
+                   help="also emit every leaf's frontmatter")
+    p.set_defaults(fn=cmd_routes)
+
+    p = sub.add_parser("reindex-routes",
+                       help="regenerate entries[]/subroutes in every _route.md from leaves")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(fn=cmd_reindex_routes)
+
+    p = sub.add_parser("sync", help="reindex-routes + audit-topics --fix + index")
+    p.add_argument("--quiet", action="store_true")
+    p.set_defaults(fn=cmd_sync)
+
+    p = sub.add_parser("doctor", help="staleness + referential integrity report")
+    p.add_argument("--recipe-max-age", type=int, default=90,
+                   help="days before an active recipe counts as stale (default 90)")
+    p.set_defaults(fn=cmd_doctor)
+
+    args = ap.parse_args()
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
