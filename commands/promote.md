@@ -30,3 +30,4 @@ That's it. No analysis, no summarization — Gregor will drive from here.
 - Read-only operation. Do not modify the entry.
 - Do not load multiple entries unless Gregor asks (`/promote` takes one argument).
 - Do not also load related entries automatically — keep HOT tight; Gregor can `/promote` more on demand.
+- If Gregor only wants a specific fact out of the entry (not the whole transcript in context), `/ask` — which delegates to the cheap `kb-researcher` subagent — is the token-efficient alternative. Mention it only if he seems to be promoting just to extract one thing.

@@ -131,7 +131,7 @@ CREATE TABLE IF NOT EXISTS meta (
   path TEXT PRIMARY KEY,        -- kb:/ URI
   mtime REAL NOT NULL,
   id TEXT,
-  doctype TEXT NOT NULL,        -- entry | recipe | route
+  doctype TEXT NOT NULL,        -- entry | recipe | model | route
   status TEXT,
   title TEXT,
   created TEXT,
@@ -145,7 +145,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(
 );
 CREATE TABLE IF NOT EXISTS edges (
   src TEXT NOT NULL,            -- source id
-  kind TEXT NOT NULL,           -- related|supersedes|superseded_by|contradicts|derived_from
+  kind TEXT NOT NULL,           -- related|supersedes|superseded_by|contradicts|derived_from|evidence_for|refuted_by
   target TEXT NOT NULL,         -- bare id, or kb:/ URI for related
   PRIMARY KEY (src, kind, target)
 );
@@ -162,10 +162,10 @@ def doc_fields(fm: dict, body: str, doctype: str) -> dict:
     """Flatten frontmatter into the FTS columns."""
     lst = lambda k: [str(x) for x in (fm.get(k) or []) if x is not None]
     extra_parts: list[str] = []
-    for k in ("when_to_use", "purpose"):
+    for k in ("when_to_use", "purpose", "statement"):
         if isinstance(fm.get(k), str):
             extra_parts.append(fm[k])
-    for k in ("steps", "decisions", "open_questions", "tools", "inputs"):
+    for k in ("steps", "decisions", "open_questions", "tools", "inputs", "predictions"):
         extra_parts.extend(lst(k))
     if doctype == "route":
         for sub in fm.get("subroutes") or []:
@@ -190,7 +190,8 @@ def index_edges(con: sqlite3.Connection, fm: dict) -> None:
     if not src:
         return
     con.execute("DELETE FROM edges WHERE src = ?", (src,))
-    for kind in ("related", "supersedes", "contradicts", "derived_from"):
+    for kind in ("related", "supersedes", "contradicts", "derived_from",
+                 "evidence_for", "refuted_by"):
         for t in fm.get(kind) or []:
             if isinstance(t, str):
                 con.execute("INSERT OR IGNORE INTO edges VALUES (?,?,?)", (src, kind, t))
@@ -219,7 +220,8 @@ def cmd_index(args) -> int:
         if fm is None:
             continue  # invalid files are the validator's problem, not the index's
         doctype = ("route" if path.name == "_route.md"
-                   else "recipe" if fm.get("type") == "recipe" else "entry")
+                   else "recipe" if fm.get("type") == "recipe"
+                   else "model" if fm.get("type") == "model" else "entry")
         d = doc_fields(fm, body, doctype)
         con.execute("DELETE FROM docs WHERE path = ?", (uri,))
         con.execute(
@@ -284,7 +286,8 @@ def cmd_search(args) -> int:
     elif not args.routes:
         sql += " AND m.doctype != 'route'"
     if not args.all_status:
-        sql += " AND (m.status IN ('active','draft') OR m.status IS NULL)"
+        # active/draft are the live leaf+recipe statuses; hypothesis/validated the live model ones
+        sql += " AND (m.status IN ('active','draft','hypothesis','validated') OR m.status IS NULL)"
     for t in args.topic or []:
         sql += " AND (',' || replace(m.topics, ' ', '') || ',') LIKE ?"
         params.append(f"%,{t},%")
@@ -426,6 +429,21 @@ def cmd_routes(args) -> int:
                 if fm and fm.get("type") == "recipe":
                     tag = "" if fm.get("status") == "active" else f" [{fm.get('status')}]"
                     out.append(f"  {fm.get('id')}{tag}: {first_line(fm.get('when_to_use'), 150)}")
+        # models get their statement line — the ambient premises for deduction
+        mdl_dir = root / "models"
+        if mdl_dir.is_dir():
+            stmts = []
+            for p in sorted(mdl_dir.glob("*.md")):
+                if p.name == "_route.md":
+                    continue
+                fm, _ = parse_fm(p)
+                if fm and fm.get("type") == "model" and fm.get("status") != "superseded":
+                    tag = f" [{fm.get('status')}]"
+                    stmts.append(f"  {fm.get('id')}{tag}: {first_line(fm.get('statement'), 150)}")
+            if stmts:
+                out.append("")
+                out.append("model statements (deductive premises — combine to derive; cite ids):")
+                out.extend(stmts)
         text = "\n".join(out)
         print(text)
         chars = len(text)
@@ -656,6 +674,32 @@ def cmd_doctor(args) -> int:
                     report("stale-recipe", f"{rid} last verified {age}d ago")
             except ValueError:
                 report("bad-date", f"{rid} last_verified unparseable: {lv!r}")
+    # model hygiene: the Popperian loop must not silt up
+    for p in walk_md(root):
+        fm, _ = parse_fm(p)
+        if not fm or fm.get("type") != "model":
+            continue
+        mid = fm.get("id")
+        status = fm.get("status")
+        if status == "refuted" and not fm.get("refuted_by"):
+            report("bad-model", f"{mid} refuted but refuted_by is empty")
+        if status == "validated" and not fm.get("evidence_for"):
+            report("bad-model", f"{mid} validated but evidence_for is empty")
+        if status in ("hypothesis", "validated") and fm.get("refuted_by"):
+            report("needs-review",
+                   f"{mid} is {status} but has refuted_by evidence — refute it or narrow the statement")
+        if not fm.get("derived_from"):
+            report("ungrounded", f"{mid} has no derived_from — a model with no grounding episodes")
+        if status == "hypothesis":
+            created = fm.get("created") or ""
+            try:
+                age = (now - datetime.strptime(created, "%Y-%m-%dT%H:%M:%SZ")
+                       .replace(tzinfo=timezone.utc)).days
+            except ValueError:
+                age = -1
+            if age > args.model_max_age and not fm.get("evidence_for"):
+                report("stale-model",
+                       f"{mid} hypothesis for {age}d with no confirming episode — test or drop")
     # route drift: leaf on disk newer than its route's last_indexed
     for rp in [p for p in walk_md(root) if p.name == "_route.md"]:
         fm, _ = parse_fm(rp)
@@ -692,7 +736,7 @@ def main() -> int:
     p = sub.add_parser("search", help="BM25 full-text search")
     p.add_argument("query", nargs="+")
     p.add_argument("-n", type=int, default=10, help="max hits (default 10)")
-    p.add_argument("--type", choices=["entry", "recipe", "route", "all"], default="all")
+    p.add_argument("--type", choices=["entry", "recipe", "model", "route", "all"], default="all")
     p.add_argument("--topic", action="append", help="require a topic tag (repeatable)")
     p.add_argument("--person", action="append", help="require a participant (repeatable)")
     p.add_argument("--all-status", action="store_true",
@@ -729,6 +773,8 @@ def main() -> int:
     p = sub.add_parser("doctor", help="staleness + referential integrity report")
     p.add_argument("--recipe-max-age", type=int, default=90,
                    help="days before an active recipe counts as stale (default 90)")
+    p.add_argument("--model-max-age", type=int, default=60,
+                   help="days a hypothesis may sit unconfirmed before flagging (default 60)")
     p.set_defaults(fn=cmd_doctor)
 
     args = ap.parse_args()

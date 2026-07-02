@@ -23,6 +23,7 @@ CLAUDE_DIR="$HOME/.claude"
 SETTINGS="$CLAUDE_DIR/settings.json"
 CMD_DIR="$CLAUDE_DIR/commands"
 SKILL_DIR="$CLAUDE_DIR/skills"
+AGENT_DIR="$CLAUDE_DIR/agents"
 HOOK="$KB_ENGINE_DIR/hooks/normalize-topics.sh"
 START_HOOK="$KB_ENGINE_DIR/hooks/session-start.sh"
 ALLOW_HOOK="$KB_ENGINE_DIR/hooks/allow-kb-query.sh"
@@ -64,6 +65,13 @@ if [ "$UNINSTALL" = 1 ]; then
     link="$SKILL_DIR/$name"
     if [ -L "$link" ]; then rm -f "$link"; ok "removed skill $name"; fi
   done
+  if [ -d "$AGENT_DIR" ]; then
+    for src in "$KB_ENGINE_DIR"/agents/*.md; do
+      [ -e "$src" ] || continue
+      link="$AGENT_DIR/$(basename "$src")"
+      if [ -L "$link" ] && [ "$(readlink "$link")" = "$src" ]; then rm -f "$link"; ok "removed agent $(basename "$src")"; fi
+    done
+  fi
   if [ -f "$SETTINGS" ] && [ -n "$PY" ]; then
     "$PY" - "$SETTINGS" "$KB_ENGINE_DIR" "$KB_DATA_DIR" "$HOOK" "$START_HOOK" "$ALLOW_HOOK" <<'PYEOF'
 import json, sys
@@ -182,6 +190,12 @@ for sk in "$KB_ENGINE_DIR"/skills/*/; do
   name="$(basename "$sk")"
   ln -sfn "${sk%/}" "$SKILL_DIR/$name"
   ok "linked skill $name"
+done
+mkdir -p "$AGENT_DIR"
+for src in "$KB_ENGINE_DIR"/agents/*.md; do
+  [ -e "$src" ] || continue
+  ln -sf "$src" "$AGENT_DIR/$(basename "$src")"
+  ok "linked agent $(basename "$src" .md)"
 done
 echo
 

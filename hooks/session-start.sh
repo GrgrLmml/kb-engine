@@ -48,6 +48,7 @@ One line per entry: `id — one-line summary`, grouped by folder; recipe trigger
 Use it to notice when prior context exists. To act on it:
 - `{engine}/scripts/kb search <terms>` — ranked full-text search (or the /find command)
 - `{engine}/scripts/kb show <id>` — print a full entry (or /promote <id>)
+- for questions answered INSIDE transcripts (exact commands, "how did we…", multi-entry overviews): delegate to the `kb-researcher` subagent (or /ask) instead of reading transcripts here
 Do not treat this index as complete detail — it is the WARM-tier map, not the content.
 
 {index}
