@@ -50,6 +50,10 @@ Three layers, each doing only what it's good at:
 
 Context is loaded in tiers — **HOT** (full transcript), **WARM** (summaries and route indexes), **COLD** (on disk) — so a big corpus never crowds the window: the ambient index is the WARM map, and `/find` / `/promote` move things up the temperature scale on demand.
 
+Between WARM and HOT sits **delegated extraction**: for questions whose answer lives inside transcript bodies ("how did we trigger the recovery update last time?", "overview of my last 3 incidents"), a cheap read-only `kb-researcher` subagent (Haiku) reads the full transcripts in *its own* context and returns only the distilled, cited answer — the main window never pays for the transcripts. The `kb-recall` skill routes plain questions there automatically; `/ask` is the explicit entry point.
+
+Above the episodes sits the **theory layer** (`kb:/models/`, `type: model`): falsifiable claims about how things work, each with a `statement` (the premise), `predictions` (testable consequences), and grounding/evidence edges. Episodes record what happened (induction generalizes over them); models let the system *deduce* — chain two statements and derive a conclusion no transcript records, always labeled `derived` with its premise ids. `/theorize` mints them (as `hypothesis`), filing checks each new episode against their predictions (confirm → `validated`, counterexample → flagged for refutation), and `kb doctor` polices the loop.
+
 ## Commands at a glance
 
 | | Command | What it does |
@@ -59,11 +63,13 @@ Context is loaded in tiers — **HOT** (full transcript), **WARM** (summaries an
 | | `/extract-recipe` | distill a reusable procedure ("how we do X") into `kb:/recipes/` |
 | **Retrieve** | *(ambient)* | every session starts with the KB index; Claude recalls proactively |
 | | `/find <query>` | ranked search → best matches into context, curated edges followed |
+| | `/ask <question>` | cheap subagent reads the transcripts, returns only the distilled cited answer |
 | | `/start <intent>` | bootstrap a session with everything relevant to what you're about to do |
 | | `/promote <id>` | load an entry's full transcript (HOT tier) |
 | | `/load-kb` | load the whole route layer (high-recall baseline) |
 | **Maintain** | `/tidy` | split + collapse + dedup + recipe-mining passes |
 | | `/mine-recipes` | find recurring procedures across the KB, propose draft recipes |
+| | `/theorize` | mint explanatory models (falsifiable claims) + chain them into derived conclusions |
 | | `kb doctor` | broken refs, stale recipes, route drift |
 
 ## Install
@@ -73,7 +79,7 @@ git clone <this repo> && cd kb-engine
 ./install.sh
 ```
 
-`install.sh` checks dependencies (`git`, `uv`, `python3`), bootstraps an empty `kb-data/`, symlinks the slash commands into `~/.claude/commands/` and the `kb-recall` skill into `~/.claude/skills/`, writes `KB_ENGINE_DIR` and `KB_DATA_DIR` into `~/.claude/settings.json`, registers the hooks (SessionStart ambient index, SessionEnd topic normalization, PreToolUse permission hook so KB queries never hit a permission prompt), adds permission allow rules for the engine scripts plus `kb-data` as an additional working directory, and installs the git pre-commit validator. It prompts before editing `~/.claude/settings.json`, is **idempotent / re-runnable**, and supports `--uninstall`.
+`install.sh` checks dependencies (`git`, `uv`, `python3`), bootstraps an empty `kb-data/`, symlinks the slash commands into `~/.claude/commands/`, the `kb-recall` skill into `~/.claude/skills/`, and the `kb-researcher` subagent into `~/.claude/agents/`, writes `KB_ENGINE_DIR` and `KB_DATA_DIR` into `~/.claude/settings.json`, registers the hooks (SessionStart ambient index, SessionEnd topic normalization, PreToolUse permission hook so KB queries never hit a permission prompt), adds permission allow rules for the engine scripts plus `kb-data` as an additional working directory, and installs the git pre-commit validator. It prompts before editing `~/.claude/settings.json`, is **idempotent / re-runnable**, and supports `--uninstall`.
 
 - Keep content elsewhere: `./install.sh --kb-data /path/to/kb-data`
 - Skip the settings prompt: `./install.sh --yes`
@@ -96,8 +102,9 @@ Claude Code refuses to prefix-match allow rules against commands containing vari
 - `docs/schema.md` — the frontmatter contract for leaf entries, recipes, and `_route.md` files. Read this first.
 - `docs/plan-day2.md` — the day-2 maturity plan this architecture implements.
 - `templates/` — starter files for new entries, recipes, routes, and the topic/tools vocabularies.
-- `commands/` — Claude Code slash commands (`/file-this`, `/jot`, `/find`, `/load-kb`, `/start`, `/promote`, `/split`, `/collapse`, `/dedup`, `/tidy`, `/extract-recipe`, `/mine-recipes`).
+- `commands/` — Claude Code slash commands (`/file-this`, `/jot`, `/find`, `/ask`, `/load-kb`, `/start`, `/promote`, `/split`, `/collapse`, `/dedup`, `/tidy`, `/extract-recipe`, `/mine-recipes`, `/theorize`).
 - `skills/kb-recall/` — proactive-recall skill (symlinked into `~/.claude/skills` by install).
+- `agents/kb-researcher.md` — cheap read-only extraction subagent (symlinked into `~/.claude/agents` by install; used by `/ask` and `kb-recall`).
 - `librarian/procedure-file.md` — canonical filing procedure shared by the slash command and the headless librarian script.
 - `scripts/kb` — the deterministic CLI (see below). `scripts/validate.py` — schema validator. `scripts/audit-topics.py` — topic normalization. `scripts/librarian` — headless maintenance.
 - `hooks/session-start.sh` — SessionStart ambient-index injection. `hooks/normalize-topics.sh` — SessionEnd topic sweep + index refresh. `hooks/allow-kb-query.sh` — PreToolUse permission hook (see above). `hooks/auto-recall.sh` — experimental per-prompt recall (NOT registered by default). `hooks/pre-commit` — schema validator gate. `hooks/session-end.sh` — legacy auto-file (off by default).
@@ -211,6 +218,8 @@ Validator output is one error per line, prefixed with the file's `kb:/` path. Ex
 - [x] Day-2 Phase 3: `kb sync` filing + `/jot`
 - [x] Slice 6 (partial): staleness via `kb doctor` (recipes, broken refs, route drift)
 - [x] Permission hook (`allow-kb-query.sh`) — KB access without confirmation fatigue
+- [x] Delegated extraction: `kb-researcher` subagent (Haiku) + `/ask` — transcript-depth answers without HOT-loading transcripts
+- [x] Deduction layer: `type: model` (`kb:/models/`) + `/theorize` + prediction-check on filing + model hygiene in `kb doctor`
 - [ ] Day-2 Phase 4: hybrid semantic search — trigger: deep corpus ≳150–200k tokens (see `docs/plan-day2.md`)
 - [ ] Scheduled `/tidy` + `kb doctor` (cron / scheduled agent)
 - [ ] link-fix mode (when path-rewrite bugs surface)

@@ -66,8 +66,20 @@ RECIPE_OPTIONAL_PRESENT = {
 }
 RECIPE_ALL = RECIPE_REQUIRED | RECIPE_OPTIONAL_PRESENT
 
+# Models are evergreen declarative leaves (type: model) — the theory layer.
+# Same leaf machinery as recipes (id==stem, no date prefix, listed in parent
+# route) but carry a falsifiable statement + prediction/evidence fields.
+MODEL_REQUIRED = {"type", "id", "title", "created", "updated", "status",
+                  "statement", "summary"}
+MODEL_OPTIONAL_PRESENT = {
+    "predictions", "derived_from", "evidence_for", "refuted_by",
+    "topics", "related", "sources", "supersedes", "superseded_by",
+}
+MODEL_ALL = MODEL_REQUIRED | MODEL_OPTIONAL_PRESENT
+
 VALID_STATUS = {"active", "superseded", "archived"}
 RECIPE_VALID_STATUS = {"active", "draft", "superseded"}
+MODEL_VALID_STATUS = {"hypothesis", "validated", "refuted", "superseded"}
 ISO_UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 
@@ -78,6 +90,7 @@ class Validator:
     routes: dict[Path, dict] = field(default_factory=dict)   # _route.md path -> frontmatter
     entries: dict[Path, dict] = field(default_factory=dict)  # episodic leaf path -> frontmatter
     recipes: dict[Path, dict] = field(default_factory=dict)  # recipe leaf path -> frontmatter
+    models: dict[Path, dict] = field(default_factory=dict)   # model leaf path -> frontmatter
 
     def err(self, path: Path, msg: str) -> None:
         self.errors.append((path, msg))
@@ -288,6 +301,84 @@ class Validator:
         if isinstance(summary, str) and len(summary.strip()) < 20:
             self.err(file, f"summary too short ({len(summary.strip())} chars) — make it WARM-tier useful")
 
+    # ------------------------------------------------------------- model checks
+
+    def validate_model(self, file: Path, fm: dict) -> None:
+        self.models[file] = fm
+
+        missing = MODEL_REQUIRED - set(fm.keys())
+        if missing:
+            self.err(file, f"missing required model fields: {sorted(missing)}")
+        self.check_unknown_keys(file, fm, MODEL_ALL, "model")
+
+        if fm.get("type") != "model":
+            self.err(file, f"type must be 'model', got: {fm.get('type')!r}")
+
+        # id matches filename stem (no date prefix); ids unique tree-wide
+        expected_id = file.stem
+        actual_id = fm.get("id")
+        if isinstance(actual_id, str):
+            if actual_id != expected_id:
+                self.err(file, f"id={actual_id!r} doesn't match filename stem {expected_id!r}")
+            if actual_id in self.ids_seen and self.ids_seen[actual_id] != file:
+                self.err(file, f"duplicate id {actual_id!r} (also at {self.ids_seen[actual_id]})")
+            else:
+                self.ids_seen[actual_id] = file
+
+        # status + status/evidence consistency
+        status = fm.get("status")
+        if "status" in fm and status not in MODEL_VALID_STATUS:
+            self.err(file, f"model status must be one of {sorted(MODEL_VALID_STATUS)}, got {status!r}")
+        if status == "validated" and not fm.get("evidence_for"):
+            self.err(file, "status 'validated' requires non-empty evidence_for")
+        if status == "refuted" and not fm.get("refuted_by"):
+            self.err(file, "status 'refuted' requires non-empty refuted_by")
+
+        # timestamps
+        for f_name in ("created", "updated"):
+            if f_name in fm:
+                self.check_iso_utc(file, f_name, fm[f_name])
+
+        # statement: the falsifiable premise — load-bearing
+        stmt = fm.get("statement")
+        if not isinstance(stmt, str) or len(stmt.strip()) < 20:
+            self.err(file, "statement must be a substantive claim (>=20 chars)")
+
+        # predictions: list of strings if present
+        preds = fm.get("predictions")
+        if preds is not None and not isinstance(preds, list):
+            self.err(file, "predictions must be a list")
+
+        # grounding must not double as confirmation (circularity guard)
+        derived = set(fm.get("derived_from") or [])
+        evidence = set(fm.get("evidence_for") or [])
+        circular = derived & evidence
+        if circular:
+            self.err(file, f"evidence_for overlaps derived_from (circular): {sorted(circular)}")
+
+        # derived_from / evidence_for / refuted_by / supersedes: bare ids
+        for f_name in ("derived_from", "evidence_for", "refuted_by", "supersedes"):
+            for v in fm.get(f_name) or []:
+                if not isinstance(v, str) or v.startswith("kb:/") or v.startswith("http"):
+                    self.err(file, f"{f_name}[] should be a bare id, got: {v!r}")
+        sb = fm.get("superseded_by")
+        if sb is not None and (not isinstance(sb, str) or sb.startswith("kb:/") or sb.startswith("http")):
+            self.err(file, f"superseded_by should be null or a bare id, got: {sb!r}")
+
+        # related: kb:/ paths to existing files
+        for v in fm.get("related") or []:
+            self.check_kb_path(file, "related[]", v)
+
+        # sources: http(s) URLs
+        for v in fm.get("sources") or []:
+            if not isinstance(v, str) or not (v.startswith("http://") or v.startswith("https://")):
+                self.err(file, f"sources[] not an http(s) URL: {v!r}")
+
+        # summary present and non-trivial
+        summary = fm.get("summary")
+        if isinstance(summary, str) and len(summary.strip()) < 20:
+            self.err(file, f"summary too short ({len(summary.strip())} chars) — make it WARM-tier useful")
+
     # ------------------------------------------------------------- route checks
 
     def validate_route(self, file: Path, fm: dict) -> None:
@@ -340,8 +431,8 @@ class Validator:
     # --------------------------------------------------------- cross invariants
 
     def validate_crosslinks(self) -> None:
-        # Every leaf (episodic entry or recipe) must appear in its parent _route.md's entries[]
-        for entry_path, entry_fm in {**self.entries, **self.recipes}.items():
+        # Every leaf (episodic entry, recipe, or model) must appear in its parent _route.md's entries[]
+        for entry_path, entry_fm in {**self.entries, **self.recipes, **self.models}.items():
             parent_route = entry_path.parent / "_route.md"
             if parent_route not in self.routes:
                 self.err(entry_path, f"parent folder has no _route.md at {parent_route}")
@@ -407,6 +498,8 @@ def main() -> int:
             v.validate_route(path, fm)
         elif fm.get("type") == "recipe":
             v.validate_recipe(path, fm)
+        elif fm.get("type") == "model":
+            v.validate_model(path, fm)
         else:
             v.validate_entry(path, fm)
 
@@ -424,7 +517,8 @@ def main() -> int:
         return 1
 
     if not args.quiet:
-        print(f"ok: {file_count} files, {len(v.routes)} routes, {len(v.entries)} entries, {len(v.recipes)} recipes — schema clean")
+        print(f"ok: {file_count} files, {len(v.routes)} routes, {len(v.entries)} entries, "
+              f"{len(v.recipes)} recipes, {len(v.models)} models — schema clean")
     return 0
 
 

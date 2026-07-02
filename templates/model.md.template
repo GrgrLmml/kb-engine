@@ -1,0 +1,30 @@
+---
+type: model
+id: {{slug}}
+title: {{title}}
+created: {{ISO8601_UTC}}
+updated: {{ISO8601_UTC}}
+status: hypothesis
+statement: |
+  {{ONE falsifiable claim about how something works. This is the deductive
+  premise — state it so it could be proven wrong. Two claims = two models.}}
+predictions:
+  - {{testable consequence a future episode could confirm or refute}}
+derived_from: []
+evidence_for: []
+refuted_by: []
+topics: []
+related: []
+sources: []
+supersedes: []
+superseded_by: null
+summary: |
+  {{two-paragraph WARM summary — what the model claims, what grounds it, and
+  what it lets you derive}}
+---
+
+# {{title}}
+
+{{The full argument: the mechanism, why the grounding episodes support the claim,
+known boundary conditions (where the model does NOT apply), and the reasoning
+behind each prediction. This body is the HOT payload.}}

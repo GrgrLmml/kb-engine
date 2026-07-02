@@ -1,10 +1,11 @@
 # KB schema
 
-Three file shapes live in `kb-data/`:
+Four file shapes live in `kb-data/`:
 
 1. **Leaf entries** — one per filed conversation (episodic). Filename: `<YYYY-MM-DD>-<slug>.md`.
 2. **Recipes** — reusable procedures distilled from one or more conversations (evergreen, `type: recipe`). Filename: `<slug>.md` (no date prefix). Live under `kb:/recipes/`.
-3. **`_route.md`** — one per folder. The folder index. Used by the retriever to traverse without loading leaves.
+3. **Models** — declarative claims about how something works (evergreen, `type: model`). Filename: `<slug>.md` (no date prefix). Live under `kb:/models/`.
+4. **`_route.md`** — one per folder. The folder index. Used by the retriever to traverse without loading leaves.
 
 All paths inside frontmatter use the **`kb:/` URI scheme**, rooted at the kb-data directory (e.g. `kb:/people/alex/_route.md`). Tooling resolves `kb:/` → `$KB_DATA_DIR/` at read time. The scheme makes it impossible to confuse with a filesystem path.
 
@@ -127,6 +128,72 @@ must be present.
 
 ---
 
+## Model frontmatter (`type: model`)
+
+A model is a **declarative claim** — "how it works / what is true" — where an entry is
+"what happened" and a recipe is "how we do X". Models are the KB's theory layer: the
+explicit premises that deduction chains together to derive conclusions no single entry
+records. They are minted by `/theorize` (abduction over episodes), consulted at answer
+time (`kb-researcher`, `kb-recall`), and confirmed or refuted as new episodes get filed.
+Models live under `kb:/models/` and ride the same `_route.md` graph.
+
+```yaml
+---
+type: model
+id: api-tier-shared-queue-contention    # slug only, NO date prefix. Stable. Matches filename stem.
+title: api-tier shared queue — client timeouts under backlog
+created: 2026-07-02T00:00:00Z         # when the model was first stated
+updated: 2026-07-02T00:00:00Z         # bumped on any edit or status change
+status: hypothesis                    # hypothesis | validated | refuted | superseded
+statement: |                          # LOAD-BEARING — the premise itself, one falsifiable claim.
+  api-tier serves all customers from one shared request queue. Any client whose
+  timeout is shorter than queue latency under backlog will report failures,
+  regardless of that client's own traffic volume.
+predictions:                          # testable consequences deduced from the statement
+  - A customer's translation "failure" rate tracks global batch load, not their own volume.
+  - Raising a client timeout above worst-case queue latency eliminates its failures without any model change.
+derived_from:                         # abduction provenance — episode ids that suggested the model
+  - 2026-06-29-acme-timeouts-api-tier-queue-v4-langs
+evidence_for:                         # episode ids where a prediction later held
+  - 2026-06-26-synthetic-translate-step6-api-tier-batch-backlog
+refuted_by: []                        # episode ids that contradict the model (any non-empty -> review status)
+topics: [api-tier, queue-contention]    # normalized against _topics.yaml, as usual
+related:                              # kb:/ cross-links, as usual
+  - kb:/work/infrastructure/_route.md
+sources: []                           # external pointers, optional
+supersedes: []                        # bare ids of models this replaces (newest-wins)
+superseded_by: null
+summary: |
+  Two-paragraph WARM-tier summary — what the model claims, what grounds it, and
+  what it lets you derive.
+---
+
+# <title>
+
+The full argument: the mechanism, why the grounding episodes support the claim, known
+boundary conditions (where the model does NOT apply), and the reasoning behind each
+prediction. This body is the HOT payload.
+```
+
+### Required fields
+
+`type` (always `model`), `id`, `title`, `created`, `updated`, `status`, `statement`,
+`summary`. The rest (`predictions`, `derived_from`, `evidence_for`, `refuted_by`,
+`topics`, `related`, `sources`, `supersedes`, `superseded_by`) may be empty/`null`
+but the keys must be present.
+
+### Field semantics
+
+- **`id`**: Slug only, **no date prefix** (models are evergreen and revisable in place). Stable forever; matches the filename stem.
+- **`status`**: `hypothesis` — proposed (e.g. by `/theorize`), not yet independently confirmed. `validated` — at least one prediction held in a *later* episode (`evidence_for` non-empty). `refuted` — a counterexample landed (`refuted_by` non-empty); keep the file, it documents a dead end. `superseded` — replaced by a sharper model (set `superseded_by`).
+- **`statement`**: The premise deduction actually uses. One claim, stated so it *could* be false. If you need two claims, write two models — small premises compose; blobs don't.
+- **`predictions`**: Consequences that follow deductively from the statement, phrased so a future episode can confirm or refute them. This is what the filing pass checks new entries against.
+- **`derived_from` vs `evidence_for`**: `derived_from` is where the model *came from* (those episodes can't also count as confirmation — that would be circular). `evidence_for` is episodes filed *after* the model that match a prediction. Only `evidence_for` justifies `validated`.
+- **`refuted_by`**: The Popperian edge. One solid counterexample outweighs any amount of confirmation; when set, flip status to `refuted` (or refine the statement's boundary conditions and keep it `hypothesis`).
+- **`summary`**: Load-bearing, same as for leaf entries.
+
+---
+
 ## `_route.md` frontmatter
 
 ```yaml
@@ -172,8 +239,8 @@ The retriever reads frontmatter to traverse; it reads the prose only when WARM-l
 ## Invariants
 
 - Every folder under `kb-data/` has exactly one `_route.md`.
-- Every leaf — episodic entry **or recipe** — has its parent folder list it in that `_route.md`'s `entries`.
-- `id` is unique across the whole kb-data tree (recipe ids share the same namespace as entry ids).
+- Every leaf — episodic entry, recipe, **or model** — has its parent folder list it in that `_route.md`'s `entries`.
+- `id` is unique across the whole kb-data tree (recipe and model ids share the same namespace as entry ids).
 - All paths in frontmatter use the `kb:/` URI scheme. External URLs (`https://`) keep their normal form. Bare ids (in `supersedes` / `contradicts` / `superseded_by`) are not paths and need no prefix.
 - All timestamps are ISO 8601 UTC.
 
