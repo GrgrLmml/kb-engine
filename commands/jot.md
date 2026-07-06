@@ -1,6 +1,6 @@
 ---
 description: Capture a small durable fact into Gregor's KB in seconds (no transcript)
-argument-hint: <the fact — e.g. "staging Qdrant lives in the staging-2 GKE cluster, namespace vdb">
+argument-hint: <the fact — e.g. "the staging vector DB lives in the staging-2 cluster, namespace search">
 ---
 
 You are capturing a **jot** — a small, durable fact — into Gregor's knowledge base: **$ARGUMENTS**

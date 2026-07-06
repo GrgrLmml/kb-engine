@@ -47,9 +47,9 @@ You have exactly three judgment steps (1–3) and one mechanical step (4).
    ```
    Read its output: note any topic-polysemy warnings (they are not auto-changed and may need a manual, more-specific tag). Do NOT hand-edit any `_route.md` entries/subroutes/last_indexed — `kb sync` owns those now. The derived one-line entry summary in the route is taken from your leaf `summary`'s first sentence; if you can write a sharper ≤100-char one-liner, you may edit it in the route afterwards (it is preserved on future syncs).
 
-5. **Check the models** (the deduction layer's test loop — cheap, skip only if `kb:/models/` doesn't exist). Read the frontmatter of every non-superseded model under `kb:/models/` (`statement`, `predictions`, `evidence_for`, `refuted_by`) and compare against the entry you just filed:
-   - The new episode **matches a prediction** → append the entry id to that model's `evidence_for` (never to a model whose `derived_from` already contains it — grounding isn't confirmation), bump `updated:`. If this is the first confirmation, flip `status: hypothesis → validated`.
+5. **Test the models** (the theory layer's empirical loop — cheap, skip only if `kb:/models/` doesn't exist). Read the frontmatter of every non-superseded model under `kb:/models/` (`statement`, `predictions`, `evidence_for`, `refuted_by`) and compare against the entry you just filed. Check for refutation FIRST — one counterexample outweighs any amount of corroboration:
    - The new episode **contradicts the statement or a prediction** → append the entry id to `refuted_by`, bump `updated:`, and flag it in your report — do NOT silently flip status to `refuted`; Gregor decides whether the model dies or gains a boundary condition.
+   - The new episode **matches a prediction** → append the entry id to that model's `evidence_for` (never to a model whose `derived_from` already contains it — grounding isn't corroboration), bump `updated:`. If this is the first later episode to test it, flip `status: hypothesis → corroborated` — corroborated means *survived a test*, never proven; a future counterexample still kills it.
    - Neither → move on. Most filings touch no model.
    If you edited any model, re-run `kb sync`.
 

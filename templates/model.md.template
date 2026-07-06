@@ -7,12 +7,16 @@ updated: {{ISO8601_UTC}}
 status: hypothesis
 statement: |
   {{ONE falsifiable claim about how something works. This is the deductive
-  premise — state it so it could be proven wrong. Two claims = two models.}}
+  premise — state it so it could be proven wrong, and make it HARD TO VARY:
+  every part load-bearing for explaining the grounding episodes. A claim you
+  could tweak and still "explain" the same episodes is a bad explanation.
+  Two claims = two models.}}
 predictions:
-  - {{testable consequence a future episode could confirm or refute}}
+  - {{testable consequence a future episode could corroborate or refute}}
 derived_from: []
 evidence_for: []
 refuted_by: []
+rivals: []
 topics: []
 related: []
 sources: []

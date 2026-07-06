@@ -111,6 +111,8 @@ PYEOF
   fi
   pc="$KB_DATA_DIR/.git/hooks/pre-commit"
   if [ -L "$pc" ]; then rm -f "$pc"; ok "removed pre-commit hook"; fi
+  pcl="$KB_ENGINE_DIR/.git/hooks/pre-commit"
+  if [ -L "$pcl" ]; then rm -f "$pcl"; ok "removed engine pre-commit leak guard"; fi
   echo "Done."
   exit 0
 fi
@@ -268,6 +270,14 @@ if [ -d "$KB_DATA_DIR/.git" ]; then
   ok "installed pre-commit in kb-data"
 else
   warn "kb-data is not a git repo — skipped pre-commit"
+fi
+# Leak guard on the ENGINE repo: block commits containing terms from the
+# private $KB_DATA_DIR/_banned-terms.txt (the list never ships with the repo).
+if [ -d "$KB_ENGINE_DIR/.git" ]; then
+  ln -sf "$KB_ENGINE_DIR/hooks/pre-commit-no-leaks" "$KB_ENGINE_DIR/.git/hooks/pre-commit"
+  ok "installed pre-commit leak guard in kb-engine"
+  [ -f "$KB_DATA_DIR/_banned-terms.txt" ] || \
+    warn "no $KB_DATA_DIR/_banned-terms.txt yet — leak guard is a no-op until you create it"
 fi
 echo
 
