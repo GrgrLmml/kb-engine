@@ -9,7 +9,7 @@ Four file shapes live in `kb-data/`:
 
 All paths inside frontmatter use the **`kb:/` URI scheme**, rooted at the kb-data directory (e.g. `kb:/people/alex/_route.md`). Tooling resolves `kb:/` → `$KB_DATA_DIR/` at read time. The scheme makes it impossible to confuse with a filesystem path.
 
-External references (Unblocked, Jira, Slack, code permalinks) keep their normal `https://` URLs unchanged. `id` references in `supersedes` / `contradicts` / `superseded_by` are bare ids, not paths.
+External references (Unblocked, Jira, Slack, code permalinks) keep their normal `https://` URLs unchanged; `gs://` artifact URIs are also allowed in `sources`. Local file paths and prose descriptions are NOT sources — put them in the body. `id` references in `supersedes` / `contradicts` / `superseded_by` are bare ids, not paths.
 
 All timestamps are **ISO 8601 UTC** (e.g. `2026-05-05T14:30:00Z`).
 
@@ -28,7 +28,7 @@ topics: [1to1, alex, q2-planning]     # tags. Normalized against kb-data/_topics
 related:                              # cross-graph links. Cyclic ok. kb:/ scheme.
   - kb:/people/alex/_route.md
   - kb:/processes/1to1/_route.md
-sources:                              # external pointers (Unblocked / Jira / Slack / code permalinks). Optional.
+sources:                              # external pointers (Unblocked / Jira / Slack / code permalinks / gs:// artifacts). http(s) or gs:// only. Optional.
   - https://example.atlassian.net/browse/...
 status: active                        # active | superseded | archived
 supersedes: []                        # ids of entries this replaces (newest-wins)

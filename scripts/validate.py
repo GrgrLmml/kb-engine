@@ -193,8 +193,8 @@ class Validator:
 
         # sources: http(s) URLs
         for v in fm.get("sources") or []:
-            if not isinstance(v, str) or not (v.startswith("http://") or v.startswith("https://")):
-                self.err(file, f"sources[] not an http(s) URL: {v!r}")
+            if not isinstance(v, str) or not v.startswith(("http://", "https://", "gs://")):
+                self.err(file, f"sources[] not an http(s)/gs:// URL: {v!r}")
 
         # supersedes/contradicts/superseded_by: bare ids, NOT kb:/ paths
         for f_name in ("supersedes", "contradicts"):
@@ -295,8 +295,8 @@ class Validator:
 
         # sources: http(s) URLs
         for v in fm.get("sources") or []:
-            if not isinstance(v, str) or not (v.startswith("http://") or v.startswith("https://")):
-                self.err(file, f"sources[] not an http(s) URL: {v!r}")
+            if not isinstance(v, str) or not v.startswith(("http://", "https://", "gs://")):
+                self.err(file, f"sources[] not an http(s)/gs:// URL: {v!r}")
 
         # summary present and non-trivial
         summary = fm.get("summary")
@@ -373,8 +373,8 @@ class Validator:
 
         # sources: http(s) URLs
         for v in fm.get("sources") or []:
-            if not isinstance(v, str) or not (v.startswith("http://") or v.startswith("https://")):
-                self.err(file, f"sources[] not an http(s) URL: {v!r}")
+            if not isinstance(v, str) or not v.startswith(("http://", "https://", "gs://")):
+                self.err(file, f"sources[] not an http(s)/gs:// URL: {v!r}")
 
         # summary present and non-trivial
         summary = fm.get("summary")
