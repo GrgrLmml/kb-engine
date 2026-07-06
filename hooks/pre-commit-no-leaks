@@ -1,0 +1,74 @@
+#!/bin/bash
+# pre-commit-no-leaks — symlink this into kb-engine/.git/hooks/pre-commit so
+# every commit in the ENGINE repo is scanned against a private banned-terms
+# list before it can enter history. The engine repo is public; the KB content
+# (and anything identifying it) must never leak into it.
+#
+# The banned-terms list lives OUTSIDE this repo — in the private kb-data —
+# precisely so the list itself never ships:
+#   $KB_DATA_DIR/_banned-terms.txt   (one term per line, # comments allowed)
+#
+# Matching: case-insensitive whole words (git grep -i -w) over the FULL staged
+# tree — not just the diff — so a term already sitting in a tracked file blocks
+# the next commit too, whoever introduced it.
+#
+# Install (done by install.sh):
+#   ln -sf $KB_ENGINE_DIR/hooks/pre-commit-no-leaks \
+#          $KB_ENGINE_DIR/.git/hooks/pre-commit
+#
+# If the banned-terms file doesn't exist (e.g. a fresh clone by someone else),
+# the hook warns and allows — the list is machine-private config, and blocking
+# strangers' commits on a file they don't have would be wrong.
+#
+# Emergency bypass: git commit --no-verify. Don't.
+
+set -euo pipefail
+
+# Resolve this script's real path even though it is invoked via the symlink.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+: "${KB_ENGINE_DIR:=$(dirname "$SCRIPT_DIR")}"
+: "${KB_DATA_DIR:=$KB_ENGINE_DIR/kb-data}"
+
+BANLIST="$KB_DATA_DIR/_banned-terms.txt"
+
+if [ ! -f "$BANLIST" ]; then
+  echo "pre-commit-no-leaks: no banned-terms list at $BANLIST — skipping leak scan." >&2
+  exit 0
+fi
+
+# Strip comments and blank lines into a temp pattern file.
+PATTERNS="$(mktemp)"
+trap 'rm -f "$PATTERNS"' EXIT
+grep -vE '^[[:space:]]*(#|$)' "$BANLIST" > "$PATTERNS" || true
+[ -s "$PATTERNS" ] || exit 0
+
+# Scan the full staged tree (what the commit would publish), whole words,
+# case-insensitive. Text files only (-I): grepping compressed binaries just
+# false-positives on coincidental bytes — binary leaks are visual, see below.
+if HITS="$(git grep -I -i -w -n -f "$PATTERNS" --cached -- . 2>/dev/null)" && [ -n "$HITS" ]; then
+  echo "COMMIT BLOCKED — banned terms staged for the public engine repo:" >&2
+  echo "$HITS" | sed 's/^/  /' >&2
+  echo "" >&2
+  echo "Scrub these (the list lives at $BANLIST)." >&2
+  echo "If a hit is a false positive, refine the list — bypassing with" >&2
+  echo "--no-verify publishes it forever." >&2
+  exit 1
+fi
+
+# Binaries can't be text-scanned but can still leak (a screencast recorded
+# against the real KB, a screenshot). Warn — don't block — when this commit
+# adds or modifies one, so it gets a conscious look.
+BINS="$(git diff --cached --numstat | awk -F'\t' '$1 == "-" && $2 == "-" {print $3}')"
+if [ -n "$BINS" ]; then
+  echo "pre-commit-no-leaks: binary file(s) staged — the leak guard cannot read these;" >&2
+  echo "eyeball them for KB content (screencasts/screenshots) before pushing:" >&2
+  echo "$BINS" | sed 's/^/  /' >&2
+fi
+
+exit 0

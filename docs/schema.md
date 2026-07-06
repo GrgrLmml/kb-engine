@@ -133,31 +133,37 @@ must be present.
 A model is a **declarative claim** — "how it works / what is true" — where an entry is
 "what happened" and a recipe is "how we do X". Models are the KB's theory layer: the
 explicit premises that deduction chains together to derive conclusions no single entry
-records. They are minted by `/theorize` (abduction over episodes), consulted at answer
-time (`kb-researcher`, `kb-recall`), and confirmed or refuted as new episodes get filed.
-Models live under `kb:/models/` and ride the same `_route.md` graph.
+records. The epistemology is conjecture-and-criticism (Popper/Deutsch): models are
+**conjectured** by `/theorize` in response to *problems* (unexplained episodes,
+contradictions), **criticized** by `/criticize` (hard-to-vary check, rival conjectures,
+counterexample sweeps, crucial experiments), consulted at answer time (`kb-researcher`,
+`kb-recall`), and corroborated or refuted as new episodes get filed. A model is never
+proven — `corroborated` means it has survived testing so far. The quality bar is a
+**good explanation**: falsifiable AND hard to vary (every part of the statement
+load-bearing). Models live under `kb:/models/` and ride the same `_route.md` graph.
 
 ```yaml
 ---
 type: model
-id: api-tier-shared-queue-contention    # slug only, NO date prefix. Stable. Matches filename stem.
-title: api-tier shared queue — client timeouts under backlog
+id: api-shared-queue-contention       # slug only, NO date prefix. Stable. Matches filename stem.
+title: Shared API queue — client timeouts under backlog
 created: 2026-07-02T00:00:00Z         # when the model was first stated
 updated: 2026-07-02T00:00:00Z         # bumped on any edit or status change
-status: hypothesis                    # hypothesis | validated | refuted | superseded
-statement: |                          # LOAD-BEARING — the premise itself, one falsifiable claim.
-  api-tier serves all customers from one shared request queue. Any client whose
-  timeout is shorter than queue latency under backlog will report failures,
-  regardless of that client's own traffic volume.
+status: hypothesis                    # hypothesis | corroborated | refuted | superseded
+statement: |                          # LOAD-BEARING — the premise itself, one falsifiable, hard-to-vary claim.
+  The API tier serves all tenants from one shared request queue. Any client
+  whose timeout is shorter than queue latency under backlog will report
+  failures, regardless of that client's own traffic volume.
 predictions:                          # testable consequences deduced from the statement
-  - A customer's translation "failure" rate tracks global batch load, not their own volume.
-  - Raising a client timeout above worst-case queue latency eliminates its failures without any model change.
+  - A tenant's "failure" rate tracks global queue load, not their own volume.
+  - Raising a client timeout above worst-case queue latency eliminates its failures without any server change.
 derived_from:                         # abduction provenance — episode ids that suggested the model
-  - 2026-06-29-acme-timeouts-api-tier-queue-v4-langs
+  - 2026-06-29-acme-timeouts-shared-queue
 evidence_for:                         # episode ids where a prediction later held
-  - 2026-06-26-synthetic-translate-step6-api-tier-batch-backlog
+  - 2026-06-26-synthetic-load-test-queue-backlog
 refuted_by: []                        # episode ids that contradict the model (any non-empty -> review status)
-topics: [api-tier, queue-contention]    # normalized against _topics.yaml, as usual
+rivals: []                            # ids of competing models explaining the same episodes (symmetric — set both sides)
+topics: [api, queue-contention]       # normalized against _topics.yaml, as usual
 related:                              # kb:/ cross-links, as usual
   - kb:/work/infrastructure/_route.md
 sources: []                           # external pointers, optional
@@ -179,17 +185,18 @@ prediction. This body is the HOT payload.
 
 `type` (always `model`), `id`, `title`, `created`, `updated`, `status`, `statement`,
 `summary`. The rest (`predictions`, `derived_from`, `evidence_for`, `refuted_by`,
-`topics`, `related`, `sources`, `supersedes`, `superseded_by`) may be empty/`null`
-but the keys must be present.
+`rivals`, `topics`, `related`, `sources`, `supersedes`, `superseded_by`) may be
+empty/`null` but the keys must be present.
 
 ### Field semantics
 
 - **`id`**: Slug only, **no date prefix** (models are evergreen and revisable in place). Stable forever; matches the filename stem.
-- **`status`**: `hypothesis` — proposed (e.g. by `/theorize`), not yet independently confirmed. `validated` — at least one prediction held in a *later* episode (`evidence_for` non-empty). `refuted` — a counterexample landed (`refuted_by` non-empty); keep the file, it documents a dead end. `superseded` — replaced by a sharper model (set `superseded_by`).
-- **`statement`**: The premise deduction actually uses. One claim, stated so it *could* be false. If you need two claims, write two models — small premises compose; blobs don't.
-- **`predictions`**: Consequences that follow deductively from the statement, phrased so a future episode can confirm or refute them. This is what the filing pass checks new entries against.
-- **`derived_from` vs `evidence_for`**: `derived_from` is where the model *came from* (those episodes can't also count as confirmation — that would be circular). `evidence_for` is episodes filed *after* the model that match a prediction. Only `evidence_for` justifies `validated`.
-- **`refuted_by`**: The Popperian edge. One solid counterexample outweighs any amount of confirmation; when set, flip status to `refuted` (or refine the statement's boundary conditions and keep it `hypothesis`).
+- **`status`**: `hypothesis` — conjectured (e.g. by `/theorize`), not yet tested by a later episode. `corroborated` — at least one prediction held in a *later* episode (`evidence_for` non-empty). Deliberately not "validated": corroboration means *survived testing so far*, never proven — one counterexample still kills it. `refuted` — a counterexample landed (`refuted_by` non-empty); keep the file, it documents a dead end. `superseded` — replaced by a sharper model (set `superseded_by`).
+- **`statement`**: The premise deduction actually uses. One claim, stated so it *could* be false, and **hard to vary**: if the statement could be tweaked and still "explain" the same grounding episodes, it's a bad explanation — sharpen it until every part is load-bearing. If you need two claims, write two models — small premises compose; blobs don't.
+- **`predictions`**: Consequences that follow deductively from the statement, phrased so a future episode can corroborate or refute them. This is what the filing pass checks new entries against. The best predictions are *risky* — ones a rival model (or common sense) would bet against.
+- **`derived_from` vs `evidence_for`**: `derived_from` is where the model *came from* (those episodes can't also count as corroboration — that would be circular). `evidence_for` is episodes filed *after* the model that match a prediction. Only `evidence_for` justifies `corroborated`.
+- **`refuted_by`**: The Popperian edge. One solid counterexample outweighs any amount of corroboration; when set, flip status to `refuted` (or refine the statement's boundary conditions and keep it `hypothesis`).
+- **`rivals`**: Ids of live models that explain the same episodes differently — competing conjectures awaiting a crucial experiment. Symmetric: set the field on both models. A lone hypothesis can't be discriminated, only believed; rivals are what make criticism decisive. `kb doctor` surfaces live rival pairs as open problems; `/criticize` mints rivals and proposes the discriminating observation. When the crucial experiment lands, one side goes `refuted` (or gains a boundary condition) — remove the pair from both `rivals` lists then.
 - **`summary`**: Load-bearing, same as for leaf entries.
 
 ---

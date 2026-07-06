@@ -64,7 +64,8 @@ Run any of these in a Claude Code session once installed:
 - `/promote <id>` — load an entry's full transcript (HOT tier).
 - `/extract-recipe [id|hint]` — distill a reusable procedure ("how we do X") into `kb:/recipes/`.
 - `/mine-recipes [kb:/folder]` — mine the KB for recurring procedures, propose them as draft recipes, flag skill-graduation candidates.
-- `/theorize [kb:/folder]` — the deduction layer: mine episodes for explanatory models (falsifiable claims, `kb:/models/`), chain model statements into derived conclusions, flag premise contradictions.
+- `/theorize [kb:/folder]` — the theory layer's growth pass: harvest open problems, conjecture explanatory models (falsifiable hard-to-vary claims, `kb:/models/`) through a criticism gate, chain model statements into derived conclusions, flag premise contradictions.
+- `/criticize [model-id]` — the criticism pass: attack live models (hard-to-vary, consistency, counterexample sweep), conjecture rivals for lone hypotheses, emit the crucial-experiment queue.
 - `/split` · `/collapse` · `/dedup` · `/tidy` — librarian housekeeping passes (`/tidy` also runs the recipe-mining pass).
 
 ## Layout
@@ -74,15 +75,17 @@ Run any of these in a Claude Code session once installed:
 - `agents/` — subagent definitions (`kb-researcher`: cheap read-only transcript extraction), symlinked into `~/.claude/agents` by install.
 - `librarian/` — the canonical filing/split/collapse/dedup/extract-recipe/mine-recipes/theorize procedures.
 - `scripts/` — `kb` (deterministic CLI: search/show/edges/routes/sync/doctor), `validate.py` (schema), `audit-topics.py` (topic normalization), `librarian` (headless).
-- `hooks/` — `session-start.sh` (ambient index), `normalize-topics.sh` (SessionEnd sweep + index refresh), `auto-recall.sh` (experimental, NOT registered by default), `pre-commit` (validator), `session-end.sh` (legacy auto-file, off by default).
+- `hooks/` — `session-start.sh` (ambient index + open-problem queue), `normalize-topics.sh` (SessionEnd sweep + index refresh), `auto-recall.sh` (experimental, NOT registered by default), `pre-commit` (kb-data schema validator), `pre-commit-no-leaks` (ENGINE repo leak guard: blocks commits containing terms from the private `$KB_DATA_DIR/_banned-terms.txt` — this repo is public, KB content must never leak in), `session-end.sh` (legacy auto-file, off by default).
 - `docs/schema.md` — the frontmatter contract (leaf entries, recipes, routes). Read it before editing KB files.
 - `docs/plan-day2.md` — the day-2 maturity plan (phases 1–3 shipped; phase 4 trigger-gated).
 - `templates/` — starter files for new entries, recipes, routes, and the topic/tools vocabularies.
 
 Recipes (`type: recipe`, under `kb:/recipes/`) are evergreen reusable procedures distilled from
 conversations — see `docs/schema.md`. The `tools:` field is normalized against `kb-data/_tools.yaml`.
-Models (`type: model`, under `kb:/models/`) are falsifiable claims — the KB's theory layer: minted
-by `/theorize` as `hypothesis`, confirmed/refuted automatically as new episodes are filed, chained
+Models (`type: model`, under `kb:/models/`) are falsifiable, hard-to-vary claims — the KB's theory
+layer, grown by conjecture and criticism (never induction): conjectured by `/theorize` from open
+problems as `hypothesis`, attacked by `/criticize` (rivals + crucial experiments), corroborated or
+refuted automatically as new episodes are filed (never "validated" — survival, not proof), chained
 into `derived` conclusions at answer time (always labeled, always citing premise ids).
 
 See `README.md` for deeper detail on the architecture and the schema.

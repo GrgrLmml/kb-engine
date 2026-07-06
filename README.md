@@ -52,7 +52,7 @@ Context is loaded in tiers — **HOT** (full transcript), **WARM** (summaries an
 
 Between WARM and HOT sits **delegated extraction**: for questions whose answer lives inside transcript bodies ("how did we trigger the recovery update last time?", "overview of my last 3 incidents"), a cheap read-only `kb-researcher` subagent (Haiku) reads the full transcripts in *its own* context and returns only the distilled, cited answer — the main window never pays for the transcripts. The `kb-recall` skill routes plain questions there automatically; `/ask` is the explicit entry point.
 
-Above the episodes sits the **theory layer** (`kb:/models/`, `type: model`): falsifiable claims about how things work, each with a `statement` (the premise), `predictions` (testable consequences), and grounding/evidence edges. Episodes record what happened (induction generalizes over them); models let the system *deduce* — chain two statements and derive a conclusion no transcript records, always labeled `derived` with its premise ids. `/theorize` mints them (as `hypothesis`), filing checks each new episode against their predictions (confirm → `validated`, counterexample → flagged for refutation), and `kb doctor` polices the loop.
+Above the episodes sits the **theory layer** (`kb:/models/`, `type: model`): falsifiable, hard-to-vary claims about how things work, each with a `statement` (the premise), `predictions` (testable consequences), and grounding/evidence/rival edges. It grows by **conjecture and criticism** (Popper/Deutsch), never induction — episodes can't speak; problems provoke guesses, and criticism kills the bad ones. `/theorize` harvests open problems (anomalies, contradictions) and conjectures models to solve them, gating every candidate before minting (as `hypothesis`); `/criticize` attacks the live models — hard-to-vary checks, rival conjectures for lone hypotheses, a ranked crucial-experiment queue; filing tests each new episode against predictions (held → `corroborated`, *survived*, never proven; counterexample → flagged for refutation); models let the system *deduce* — chain two statements and derive a conclusion no transcript records, always labeled `derived` with its premise ids; and `kb doctor` keeps the problem queue (unresolved contradictions, undiscriminated rivals, untested hypotheses) visible.
 
 ## Commands at a glance
 
@@ -69,8 +69,9 @@ Above the episodes sits the **theory layer** (`kb:/models/`, `type: model`): fal
 | | `/load-kb` | load the whole route layer (high-recall baseline) |
 | **Maintain** | `/tidy` | split + collapse + dedup + recipe-mining passes |
 | | `/mine-recipes` | find recurring procedures across the KB, propose draft recipes |
-| | `/theorize` | mint explanatory models (falsifiable claims) + chain them into derived conclusions |
-| | `kb doctor` | broken refs, stale recipes, route drift |
+| | `/theorize` | harvest problems, conjecture explanatory models through a criticism gate, chain them into derived conclusions |
+| | `/criticize` | attack the live models: hard-to-vary checks, rival conjectures, crucial-experiment queue |
+| | `kb doctor` | broken refs, stale recipes, route drift, the open-problem queue |
 
 ## Install
 
@@ -79,7 +80,7 @@ git clone <this repo> && cd kb-engine
 ./install.sh
 ```
 
-`install.sh` checks dependencies (`git`, `uv`, `python3`), bootstraps an empty `kb-data/`, symlinks the slash commands into `~/.claude/commands/`, the `kb-recall` skill into `~/.claude/skills/`, and the `kb-researcher` subagent into `~/.claude/agents/`, writes `KB_ENGINE_DIR` and `KB_DATA_DIR` into `~/.claude/settings.json`, registers the hooks (SessionStart ambient index, SessionEnd topic normalization, PreToolUse permission hook so KB queries never hit a permission prompt), adds permission allow rules for the engine scripts plus `kb-data` as an additional working directory, and installs the git pre-commit validator. It prompts before editing `~/.claude/settings.json`, is **idempotent / re-runnable**, and supports `--uninstall`.
+`install.sh` checks dependencies (`git`, `uv`, `python3`), bootstraps an empty `kb-data/`, symlinks the slash commands into `~/.claude/commands/`, the `kb-recall` skill into `~/.claude/skills/`, and the `kb-researcher` subagent into `~/.claude/agents/`, writes `KB_ENGINE_DIR` and `KB_DATA_DIR` into `~/.claude/settings.json`, registers the hooks (SessionStart ambient index, SessionEnd topic normalization, PreToolUse permission hook so KB queries never hit a permission prompt), adds permission allow rules for the engine scripts plus `kb-data` as an additional working directory, and installs the git pre-commit hooks: the schema validator in kb-data, and a **leak guard** in kb-engine itself that blocks any commit containing a term from the private `$KB_DATA_DIR/_banned-terms.txt` (the engine repo is public; your KB's names must never end up in it — and the banned list itself lives outside the repo so it never ships). It prompts before editing `~/.claude/settings.json`, is **idempotent / re-runnable**, and supports `--uninstall`.
 
 - Keep content elsewhere: `./install.sh --kb-data /path/to/kb-data`
 - Skip the settings prompt: `./install.sh --yes`
@@ -102,12 +103,12 @@ Claude Code refuses to prefix-match allow rules against commands containing vari
 - `docs/schema.md` — the frontmatter contract for leaf entries, recipes, and `_route.md` files. Read this first.
 - `docs/plan-day2.md` — the day-2 maturity plan this architecture implements.
 - `templates/` — starter files for new entries, recipes, routes, and the topic/tools vocabularies.
-- `commands/` — Claude Code slash commands (`/file-this`, `/jot`, `/find`, `/ask`, `/load-kb`, `/start`, `/promote`, `/split`, `/collapse`, `/dedup`, `/tidy`, `/extract-recipe`, `/mine-recipes`, `/theorize`).
+- `commands/` — Claude Code slash commands (`/file-this`, `/jot`, `/find`, `/ask`, `/load-kb`, `/start`, `/promote`, `/split`, `/collapse`, `/dedup`, `/tidy`, `/extract-recipe`, `/mine-recipes`, `/theorize`, `/criticize`).
 - `skills/kb-recall/` — proactive-recall skill (symlinked into `~/.claude/skills` by install).
 - `agents/kb-researcher.md` — cheap read-only extraction subagent (symlinked into `~/.claude/agents` by install; used by `/ask` and `kb-recall`).
 - `librarian/procedure-file.md` — canonical filing procedure shared by the slash command and the headless librarian script.
 - `scripts/kb` — the deterministic CLI (see below). `scripts/validate.py` — schema validator. `scripts/audit-topics.py` — topic normalization. `scripts/librarian` — headless maintenance.
-- `hooks/session-start.sh` — SessionStart ambient-index injection. `hooks/normalize-topics.sh` — SessionEnd topic sweep + index refresh. `hooks/allow-kb-query.sh` — PreToolUse permission hook (see above). `hooks/auto-recall.sh` — experimental per-prompt recall (NOT registered by default). `hooks/pre-commit` — schema validator gate. `hooks/session-end.sh` — legacy auto-file (off by default).
+- `hooks/session-start.sh` — SessionStart ambient-index injection + the open-problem queue (kb doctor's unresolved contradictions / undiscriminated rivals / untested hypotheses, so sessions suggest `/theorize` or `/criticize` when warranted). `hooks/normalize-topics.sh` — SessionEnd topic sweep + index refresh. `hooks/allow-kb-query.sh` — PreToolUse permission hook (see above). `hooks/auto-recall.sh` — experimental per-prompt recall (NOT registered by default). `hooks/pre-commit` — schema validator gate (kb-data). `hooks/pre-commit-no-leaks` — leak guard on the engine repo itself, scanning every commit against the private `$KB_DATA_DIR/_banned-terms.txt`. `hooks/session-end.sh` — legacy auto-file (off by default).
 
 ## The `kb` CLI
 

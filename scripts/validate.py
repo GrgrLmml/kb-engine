@@ -72,14 +72,16 @@ RECIPE_ALL = RECIPE_REQUIRED | RECIPE_OPTIONAL_PRESENT
 MODEL_REQUIRED = {"type", "id", "title", "created", "updated", "status",
                   "statement", "summary"}
 MODEL_OPTIONAL_PRESENT = {
-    "predictions", "derived_from", "evidence_for", "refuted_by",
+    "predictions", "derived_from", "evidence_for", "refuted_by", "rivals",
     "topics", "related", "sources", "supersedes", "superseded_by",
 }
 MODEL_ALL = MODEL_REQUIRED | MODEL_OPTIONAL_PRESENT
 
 VALID_STATUS = {"active", "superseded", "archived"}
 RECIPE_VALID_STATUS = {"active", "draft", "superseded"}
-MODEL_VALID_STATUS = {"hypothesis", "validated", "refuted", "superseded"}
+# Model statuses are Popperian: a model is never proven, only corroborated
+# (survived a later test) or refuted. "corroborated" deliberately not "validated".
+MODEL_VALID_STATUS = {"hypothesis", "corroborated", "refuted", "superseded"}
 ISO_UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 
@@ -329,8 +331,8 @@ class Validator:
         status = fm.get("status")
         if "status" in fm and status not in MODEL_VALID_STATUS:
             self.err(file, f"model status must be one of {sorted(MODEL_VALID_STATUS)}, got {status!r}")
-        if status == "validated" and not fm.get("evidence_for"):
-            self.err(file, "status 'validated' requires non-empty evidence_for")
+        if status == "corroborated" and not fm.get("evidence_for"):
+            self.err(file, "status 'corroborated' requires non-empty evidence_for")
         if status == "refuted" and not fm.get("refuted_by"):
             self.err(file, "status 'refuted' requires non-empty refuted_by")
 
@@ -356,8 +358,8 @@ class Validator:
         if circular:
             self.err(file, f"evidence_for overlaps derived_from (circular): {sorted(circular)}")
 
-        # derived_from / evidence_for / refuted_by / supersedes: bare ids
-        for f_name in ("derived_from", "evidence_for", "refuted_by", "supersedes"):
+        # derived_from / evidence_for / refuted_by / rivals / supersedes: bare ids
+        for f_name in ("derived_from", "evidence_for", "refuted_by", "rivals", "supersedes"):
             for v in fm.get(f_name) or []:
                 if not isinstance(v, str) or v.startswith("kb:/") or v.startswith("http"):
                     self.err(file, f"{f_name}[] should be a bare id, got: {v!r}")

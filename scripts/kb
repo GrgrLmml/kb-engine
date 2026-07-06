@@ -145,7 +145,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(
 );
 CREATE TABLE IF NOT EXISTS edges (
   src TEXT NOT NULL,            -- source id
-  kind TEXT NOT NULL,           -- related|supersedes|superseded_by|contradicts|derived_from|evidence_for|refuted_by
+  kind TEXT NOT NULL,           -- related|supersedes|superseded_by|contradicts|derived_from|evidence_for|refuted_by|rivals
   target TEXT NOT NULL,         -- bare id, or kb:/ URI for related
   PRIMARY KEY (src, kind, target)
 );
@@ -191,7 +191,7 @@ def index_edges(con: sqlite3.Connection, fm: dict) -> None:
         return
     con.execute("DELETE FROM edges WHERE src = ?", (src,))
     for kind in ("related", "supersedes", "contradicts", "derived_from",
-                 "evidence_for", "refuted_by"):
+                 "evidence_for", "refuted_by", "rivals"):
         for t in fm.get(kind) or []:
             if isinstance(t, str):
                 con.execute("INSERT OR IGNORE INTO edges VALUES (?,?,?)", (src, kind, t))
@@ -286,8 +286,8 @@ def cmd_search(args) -> int:
     elif not args.routes:
         sql += " AND m.doctype != 'route'"
     if not args.all_status:
-        # active/draft are the live leaf+recipe statuses; hypothesis/validated the live model ones
-        sql += " AND (m.status IN ('active','draft','hypothesis','validated') OR m.status IS NULL)"
+        # active/draft are the live leaf+recipe statuses; hypothesis/corroborated the live model ones
+        sql += " AND (m.status IN ('active','draft','hypothesis','corroborated') OR m.status IS NULL)"
     for t in args.topic or []:
         sql += " AND (',' || replace(m.topics, ' ', '') || ',') LIKE ?"
         params.append(f"%,{t},%")
@@ -683,9 +683,9 @@ def cmd_doctor(args) -> int:
         status = fm.get("status")
         if status == "refuted" and not fm.get("refuted_by"):
             report("bad-model", f"{mid} refuted but refuted_by is empty")
-        if status == "validated" and not fm.get("evidence_for"):
-            report("bad-model", f"{mid} validated but evidence_for is empty")
-        if status in ("hypothesis", "validated") and fm.get("refuted_by"):
+        if status == "corroborated" and not fm.get("evidence_for"):
+            report("bad-model", f"{mid} corroborated but evidence_for is empty")
+        if status in ("hypothesis", "corroborated") and fm.get("refuted_by"):
             report("needs-review",
                    f"{mid} is {status} but has refuted_by evidence — refute it or narrow the statement")
         if not fm.get("derived_from"):
@@ -699,7 +699,29 @@ def cmd_doctor(args) -> int:
                 age = -1
             if age > args.model_max_age and not fm.get("evidence_for"):
                 report("stale-model",
-                       f"{mid} hypothesis for {age}d with no confirming episode — test or drop")
+                       f"{mid} hypothesis for {age}d untested — run /criticize (rival + crucial experiment) or drop")
+    # problem queue: open conflicts are where knowledge growth starts — surface, don't fix
+    live = {r[0]: r[1] for r in con.execute(
+        "SELECT id, status FROM meta WHERE id IS NOT NULL")}
+    live_entry = {"active", None}
+    for src, target in con.execute(
+            "SELECT DISTINCT src, target FROM edges WHERE kind = 'contradicts'"):
+        if live.get(src) in live_entry and live.get(target) in live_entry:
+            report("problem",
+                   f"{src} contradicts {target}, both active — unresolved conflict; "
+                   f"a resolution is usually a boundary condition (/theorize)")
+    live_model = {"hypothesis", "corroborated"}
+    seen_pairs = set()
+    for src, target in con.execute(
+            "SELECT DISTINCT src, target FROM edges WHERE kind = 'rivals'"):
+        pair = tuple(sorted((src, target)))
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        if live.get(src) in live_model and live.get(target) in live_model:
+            report("problem",
+                   f"{pair[0]} vs {pair[1]} — live rivals; a crucial experiment "
+                   f"should kill one (/criticize proposes it)")
     # route drift: leaf on disk newer than its route's last_indexed
     for rp in [p for p in walk_md(root) if p.name == "_route.md"]:
         fm, _ = parse_fm(rp)

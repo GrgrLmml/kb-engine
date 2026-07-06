@@ -108,11 +108,11 @@ This phase alone removes most of the day-to-day clunk.
    Filing goes from minutes to ~30 seconds, and a whole class of validator errors
    (leaf/route drift) becomes structurally impossible.
 2. **`/jot <fact>` — capture without a transcript.** Half the value of a KB is small
-   durable facts ("staging Qdrant lives in cluster X", "dana owns the vendorco
+   durable facts ("the staging vector DB lives in cluster X", "Dana owns the vendor
    relationship") that don't deserve a full filed conversation. A jot is a minimal
    leaf (frontmatter + 2–3 lines, no transcript body) filed in seconds.
-3. **Fix the 4 standing kb-data validation errors** (res-3616 colon, week-23 status,
-   week-19/21 `sources_dump`) so commits flow again — small, do it first.
+3. **Fix the 4 standing kb-data validation errors** (an unquoted colon, a bad status,
+   two stray `sources_dump` keys) so commits flow again — small, do it first.
 4. **Optional: file in the background.** `/file-this --bg` hands the distillation to a
    background agent so the session isn't blocked while filing.
 
