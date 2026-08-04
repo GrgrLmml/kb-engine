@@ -647,14 +647,38 @@ def cmd_doctor(args) -> int:
             "SELECT src, kind, target FROM edges WHERE kind = 'related'"):
         if target.startswith("kb:/") and not from_kb_uri(root, target).exists():
             report("broken-link", f"{src} related -> {target} (missing on disk)")
-    # recipe staleness
+    # recipe staleness + evidence drift
     now = datetime.now(timezone.utc)
+    entry_rows = con.execute(
+        "SELECT id, created, topics FROM meta WHERE doctype = 'entry' "
+        "AND (status IS NULL OR status = 'active') AND id IS NOT NULL").fetchall()
     for p in walk_md(root):
         fm, _ = parse_fm(p)
         if not fm or fm.get("type") != "recipe":
             continue
         rid = fm.get("id")
         lv = fm.get("last_verified")
+        # evidence drift: newer episodes in this recipe's topic area since it was
+        # last looked at — its current-state claims may be outdated even if the
+        # age-based check hasn't fired yet
+        if fm.get("status") == "active":
+            # ref = the last time anyone looked at this recipe (verified OR edited);
+            # entries already folded in via derived_from are not drift
+            ref = max(str(lv or ""), str(fm.get("updated") or ""),
+                      str(fm.get("created") or ""))
+            folded = {str(x) for x in (fm.get("derived_from") or [])}
+            rtopics = {str(t) for t in (fm.get("topics") or [])}
+            newer = [(eid, ec) for eid, ec, et in entry_rows
+                     if ec and ec > ref and eid not in folded and len(rtopics & {
+                         t.strip() for t in (et or "").split(",") if t.strip()}) >= 2]
+            if newer:
+                latest = max(newer, key=lambda x: x[1])[0]
+                basis = "last_verified" if lv else "last update"
+                report("drift-risk",
+                       f"{rid}: {len(newer)} newer entr"
+                       f"{'y shares' if len(newer) == 1 else 'ies share'} "
+                       f"≥2 of its topics since {basis} (latest: {latest}) — "
+                       f"re-verify its claims or fold the new evidence in")
         if fm.get("status") == "draft":
             created = fm.get("created") or ""
             try:

@@ -47,7 +47,7 @@ with the KB**, prefer it over manual find/grep pipelines:
 - `kb edges <id>` — typed edges, forward and reverse.
 - `kb routes [--compact|--deep]` — the route layer + BASELINE size metrics.
 - `kb sync` — after writing any leaf: regenerates route `entries[]`/`subroutes[]`/`last_indexed`, normalizes topics, refreshes the index. Never hand-edit those route fields.
-- `kb doctor` — broken refs, stale recipes, route drift.
+- `kb doctor` — broken refs, stale recipes, evidence drift (newer entries in an active recipe's topic area since it was last verified/edited → `drift-risk`), route drift.
 
 A compact KB index is auto-injected into new sessions as `<kb-ambient-index>` (SessionStart hook). The `kb-recall` skill reaches into the KB proactively.
 

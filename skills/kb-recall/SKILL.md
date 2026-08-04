@@ -45,6 +45,16 @@ This skill is how you pull the actual content.
 3. **Read the WARM payload** (frontmatter summary) of the top 1–3 hits, e.g.
    `head -60` of each file.
 
+   **As-of discipline:** an episode's facts are true as of its `created:`
+   date, not now. Before asserting a status ("currently X", "not yet Y") from
+   an entry, check the search results for newer entries in the same folder or
+   topic area — the newest evidence wins, even if it scored lower. If the best
+   evidence is old, answer "as of \<date\>", not present tense. Recipes are
+   the living layer but drift too: a recipe whose `last_verified` predates
+   newer sibling entries may carry stale claims (`kb doctor` flags these as
+   `drift-risk`) — flag it rather than serving the claim with the recipe's
+   authority.
+
 4. **Route by depth.** Two cases:
    - **Summaries suffice** (who/when/what-was-decided at headline level) →
      answer inline from the WARM payload.

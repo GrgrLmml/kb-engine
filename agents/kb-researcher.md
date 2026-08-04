@@ -46,6 +46,14 @@ find/grep pipelines, except to grep within files you've already located.
    Prefer a superseder over the superseded entry. If a `contradicts` edge
    touches your answer, report both sides — never silently pick one.
 
+   **As-of discipline:** an episode's facts are true as of its `created:`
+   date, not now. Before reporting a status assertion ("currently X", "not
+   yet Y") as fact, check for newer entries in the same folder or topic area —
+   the newest evidence wins. If the best evidence is old, report it as
+   "as of <date>", not present tense. Same for recipes: one whose
+   `last_verified` predates newer sibling entries may carry stale claims —
+   caveat that in your answer.
+
 4. **Consult the theory layer.** The KB may hold `type: model` entries under
    `kb:/models/` — explicit falsifiable claims ("how it works"), each with a
    `statement`, `predictions`, and a status. If the question isn't fully

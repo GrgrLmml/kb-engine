@@ -75,3 +75,4 @@ Add one line at the end:
 - Do not load full transcripts — that's HOT and Gregor will ask explicitly. Frontmatter only.
 - Do not modify the KB. /start is read-only.
 - The brief should be skimmable in 10 seconds. Tighter is better than longer.
+- **As-of discipline:** episode facts are true as of the entry's `created:` date. When entries in the brief disagree, the newest wins; when a status assertion ("currently X", "not yet Y") comes from an entry with newer siblings in the same folder/topic area, check those first or qualify with "as of \<date\>". A recipe whose `last_verified` predates newer entries in its topic area may carry stale claims (`kb doctor` flags these as `drift-risk`) — mark it "(may be stale)" in the brief.

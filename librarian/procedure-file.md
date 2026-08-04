@@ -47,17 +47,26 @@ You have exactly three judgment steps (1–3) and one mechanical step (4).
    ```
    Read its output: note any topic-polysemy warnings (they are not auto-changed and may need a manual, more-specific tag). Do NOT hand-edit any `_route.md` entries/subroutes/last_indexed — `kb sync` owns those now. The derived one-line entry summary in the route is taken from your leaf `summary`'s first sentence; if you can write a sharper ≤100-char one-liner, you may edit it in the route afterwards (it is preserved on future syncs).
 
-5. **Test the models** (the theory layer's empirical loop — cheap, skip only if `kb:/models/` doesn't exist). Read the frontmatter of every non-superseded model under `kb:/models/` (`statement`, `predictions`, `evidence_for`, `refuted_by`) and compare against the entry you just filed. Check for refutation FIRST — one counterexample outweighs any amount of corroboration:
+5. **Test the living layer** (models + recipes — the revision loop that keeps current-state claims current). Episodes are immutable history; models and recipes are the KB's *revisable claims about now*, and this is the moment they get checked against fresh evidence. The living layer is deliberately small, so sweep ALL of it — no topic-matching shortcuts.
+
+   **5a. Models** (skip only if `kb:/models/` doesn't exist). Read the frontmatter of every non-superseded model under `kb:/models/` (`statement`, `predictions`, `evidence_for`, `refuted_by`) and compare against the entry you just filed. Check for refutation FIRST — one counterexample outweighs any amount of corroboration:
    - The new episode **contradicts the statement or a prediction** → append the entry id to `refuted_by`, bump `updated:`, and flag it in your report — do NOT silently flip status to `refuted`; Gregor decides whether the model dies or gains a boundary condition.
    - The new episode **matches a prediction** → append the entry id to that model's `evidence_for` (never to a model whose `derived_from` already contains it — grounding isn't corroboration), bump `updated:`. If this is the first later episode to test it, flip `status: hypothesis → corroborated` — corroborated means *survived a test*, never proven; a future counterexample still kills it.
    - Neither → move on. Most filings touch no model.
-   If you edited any model, re-run `kb sync`.
+
+   **5b. Recipes** (skip only if `kb:/recipes/` doesn't exist). Read the frontmatter of every non-superseded recipe (`when_to_use`, `steps`, `summary`) and compare against the entry you just filed. Unlike episodes, recipes are living documents — when the world changed, the recipe text changes:
+   - The new episode **outdates a claim in the recipe** (a step, a caveat, a "currently X" / "not yet Y" status assertion) → EDIT the recipe in place: fix the claim (cite the entry id where useful), append the entry id to `derived_from`, add the entry to `related`, bump `updated:`, and flag it in your report. Never leave a refuted status assertion standing — a stale "honest caveat" is worse than none, because it gets served with the recipe's authority.
+   - The new episode **is a successful execution of the recipe** (in whole or in part) → bump `last_verified:` (and `updated:`), and fold in any newly learned gotchas as step refinements.
+   - Neither → move on. Most filings touch no recipe.
+
+   If you edited any model or recipe, re-run `kb sync`.
 
 6. **Report back.** Output a short summary:
    - Where the entry was filed (full path).
    - Any new folders created.
    - The entry's `id`, `topics`, and one-line summary.
-   - Any model confirmations/refutations from step 5 (`<model-id>: confirmed by this entry` / `REFUTATION FLAGGED — review <model-id>`).
+   - Any model confirmations/refutations from step 5a (`<model-id>: confirmed by this entry` / `REFUTATION FLAGGED — review <model-id>`).
+   - Any recipe revisions/verifications from step 5b (`<recipe-id>: claim updated — <one line>` / `<recipe-id>: last_verified bumped`).
 
 ## Constraints
 

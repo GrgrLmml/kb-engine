@@ -22,6 +22,8 @@ Do this **inline** — no subagent. The CLI does the mechanical work in millisec
 
 2. **Re-rank with judgment.** The BM25 score is a candidate generator, not the verdict. Read the returned titles/topics/summaries and pick the entries that actually answer the query. Recency breaks ties. Recipes answer "how do we do X" rather than "what happened" — label them `[recipe]`, and `(draft)` if status is draft.
 
+   **As-of discipline:** an episode's facts are true as of its `created:` date, not now. Before serving a status assertion ("currently X", "not yet Y") from an entry, scan the result list for newer entries in the same folder or topic area — the newest evidence wins, even if it scored lower. If the best evidence is old, say "as of \<date\>" rather than present tense.
+
 3. **Expand along the curated typed edges** for the top 2–3 candidates — these hand-maintained links carry meaning a keyword match cannot:
 
    ```sh
@@ -52,3 +54,4 @@ Do this **inline** — no subagent. The CLI does the mechanical work in millisec
 
 - Read-only: never modify the KB from this command.
 - The summaries `kb search` prints are truncated one-liners. For the verbatim `summary` field in your output, read it from the hit file's frontmatter (head -40 of the file is enough) — do not paste the truncated line.
+- Recipes and models are the living (revisable) layer, but they drift too: a recipe whose `last_verified` predates newer entries in its topic area may carry stale claims (`kb doctor` flags these as `drift-risk`). Flag that to the user rather than serving the claim with the recipe's authority.
