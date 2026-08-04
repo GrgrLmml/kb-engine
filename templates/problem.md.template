@@ -1,0 +1,37 @@
+---
+type: problem
+id: {{slug}}
+title: {{one-line problem statement}}
+created: {{now-iso}}
+updated: {{now-iso}}
+status: open
+kind: {{rivals | refuted-review | contradiction | anomaly | open-question}}
+fingerprint: {{deterministic key, e.g. rivals:model-a|model-b — kb problems scan reconciles on this}}
+models: [{{ids of the models (or entries) this problem is about}}]
+experiment: null
+# /criticize replaces `experiment: null` with the pre-registered block and flips status to ready:
+# experiment:
+#   observation: >-
+#     {{the ONE observation to make — before looking at any data}}
+#   where: >-
+#     {{exact surface: Datadog query / BigQuery table / repo path / person to ask}}
+#   outcomes:
+#     - if: {{result A}}
+#       then: {{model X REFUTED; model Y corroborated}}
+#     - if: {{result B}}
+#       then: {{model Y refuted or narrowed to a boundary condition}}
+#   cost: {{e.g. one Datadog session (~10 min)}}
+#   decisiveness: {{high | medium | low — high kills a model whichever way it lands}}
+resolved_by: null
+resolution: null
+topics: [{{tags}}]
+related: [{{kb:/ URIs of the involved leaves}}]
+sources: []
+summary: >-
+  {{what is unresolved and why it matters — WARM-tier self-contained}}
+---
+
+{{Why this is a problem: what each side claims, which episodes ground each reading,
+and what a resolution would change. The outcomes block is the load-bearing part:
+pre-registering what each result MEANS before looking prevents post-hoc
+rationalization.}}

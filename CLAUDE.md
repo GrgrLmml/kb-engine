@@ -48,6 +48,7 @@ with the KB**, prefer it over manual find/grep pipelines:
 - `kb routes [--compact|--deep]` — the route layer + BASELINE size metrics.
 - `kb sync` — after writing any leaf: regenerates route `entries[]`/`subroutes[]`/`last_indexed`, normalizes topics, refreshes the index. Never hand-edit those route fields.
 - `kb doctor` — broken refs, stale recipes, evidence drift (newer entries in an active recipe's topic area since it was last verified/edited → `drift-risk`), route drift.
+- `kb problems scan|list|brief|resolve|drop` — the epistemic ledger (`kb:/problems/`, `type: problem`): doctor findings made durable with a lifecycle (`open → ready → resolved|dropped`). `scan` mints/reconciles stubs deterministically; `/criticize` writes each stub's pre-registered crucial experiment (`ready`); `/run-experiment` observes and resolves. `resolve` requires `--by <episode-id>` — no resolution without filed evidence.
 
 A compact KB index is auto-injected into new sessions as `<kb-ambient-index>` (SessionStart hook). The `kb-recall` skill reaches into the KB proactively.
 
@@ -65,7 +66,8 @@ Run any of these in a Claude Code session once installed:
 - `/extract-recipe [id|hint]` — distill a reusable procedure ("how we do X") into `kb:/recipes/`.
 - `/mine-recipes [kb:/folder]` — mine the KB for recurring procedures, propose them as draft recipes, flag skill-graduation candidates.
 - `/theorize [kb:/folder]` — the theory layer's growth pass: harvest open problems, conjecture explanatory models (falsifiable hard-to-vary claims, `kb:/models/`) through a criticism gate, chain model statements into derived conclusions, flag premise contradictions.
-- `/criticize [model-id]` — the criticism pass: attack live models (hard-to-vary, consistency, counterexample sweep), conjecture rivals for lone hypotheses, emit the crucial-experiment queue.
+- `/criticize [model-id]` — the criticism pass: attack live models (hard-to-vary, consistency, counterexample sweep), conjecture rivals for lone hypotheses, write pre-registered crucial experiments into the problem ledger.
+- `/run-experiment [problem-id]` — execute one `ready` experiment from the ledger using the session's real tools (Datadog/BigQuery/Slack MCP), map the result onto the pre-registered outcomes, and resolve: winner corroborated, loser refuted or narrowed. Closes the conjecture-and-criticism loop.
 - `/split` · `/collapse` · `/dedup` · `/tidy` — librarian housekeeping passes (`/tidy` also runs the recipe-mining pass).
 
 ## Layout

@@ -4,14 +4,13 @@
 conjecture-and-criticism cycle (Popper/Deutsch) this is the criticism half run as a
 standing audit: most conjectures should die under *argument* — inconsistency,
 easy variability, an overlooked counterexample — long before any experiment runs.
-What survives argument gets an **experiment queue**: for each live model (and
-especially each rival pair), the cheapest observation that would refute or
-discriminate. Criticism never *confirms* anything — a model that survives this pass
-has merely survived.
+What survives argument gets a **pre-registered crucial experiment**, written into the
+durable problem ledger (`kb:/problems/`): for each live model (and especially each
+rival pair), the cheapest observation that would refute or discriminate. Criticism
+never *confirms* anything — a model that survives this pass has merely survived.
 
-This pass proposes experiments; it does not run them. Gregor (or a later session)
-runs one, files the episode, and the filing loop (`procedure-file.md` step 5) settles
-the score.
+This pass designs experiments; it does not run them. `/run-experiment` (or Gregor in
+any later session) runs one, files the episode, and resolves the ledger item.
 
 ---
 
@@ -31,8 +30,9 @@ theory layer under `kb:/models/`).
 - Skip `status: superseded` and `refuted` models as targets (they're already dead),
   but keep their statements in mind — a new model quietly re-asserting a refuted one
   is a finding.
-- Run `$KB_ENGINE_DIR/scripts/kb doctor` and note the model-related lines (`problem`,
-  `needs-review`, `stale-model`) — they prioritize the attack order.
+- Run `$KB_ENGINE_DIR/scripts/kb problems scan` (mints/reconciles ledger stubs from
+  doctor findings), then `kb problems list` — open stubs prioritize the attack order,
+  and each stub you can upgrade to `ready` is this pass's primary deliverable.
 
 ### 2. Attack each target model (argument first — cheap and decisive)
 
@@ -62,9 +62,9 @@ Then the generative attack:
   falsifiability bars (a strawman rival is noise, not criticism). No honest rival
   survives your own gate → say so; that itself raises confidence in the incumbent.
 
-### 3. Build the experiment queue
+### 3. Design the crucial experiments
 
-For every surviving model and every rival pair, propose the **cheapest decisive
+For every surviving model and every rival pair, design the **cheapest decisive
 observation**:
 
 - For a **rival pair**: the crucial experiment — one observation the two statements
@@ -75,9 +75,10 @@ observation**:
   is worthless). Prefer predictions checkable *today* against Datadog / BigQuery / a
   repo / one Slack question over waiting for an incident to happen along.
 
-Rank the queue by `decisiveness / cost`. Each item names: the model id(s), the exact
-observation, where to look (dashboard, query, repo, person), and what each outcome
-would mean.
+Rank by `decisiveness / cost`. Each experiment names: the model id(s), the exact
+observation, where to look (dashboard, query, repo, person), and — **pre-registered,
+before anyone looks at data** — what each outcome would mean. The outcomes block is
+the anti-post-hoc contract: /run-experiment may not reinterpret results outside it.
 
 ### 4. Output the report
 
@@ -95,9 +96,9 @@ NEW RIVALS (mint as hypothesis, cross-link both ways):
       statement: <the competing mechanism, one line>
       discriminated by: <the observation that would pick a winner>
 
-EXPERIMENT QUEUE (ranked, cheapest-decisive first):
-  1. [<model-id> vs <model-id>] <observation> — where: <source>. If <outcome-A> → <verdict>; if <outcome-B> → <verdict>.
-  2. [<model-id>] <riskiest prediction test> — where: <source>. Fails → refuted; holds → corroborated.
+EXPERIMENTS DESIGNED (ledger items upgraded to ready, ranked cheapest-decisive first):
+  1. <problem-id> [<model-id> vs <model-id>] <observation> — where: <source>. If <outcome-A> → <verdict>; if <outcome-B> → <verdict>.
+  2. <problem-id> [<model-id>] <riskiest prediction test> — where: <source>. Fails → refuted; holds → corroborated.
 ```
 
 If every target is SOUND and no rival survives your gate, say exactly that — a clean
@@ -116,16 +117,23 @@ bill from a serious attack is information; a clean bill from a soft one is decor
   mechanism, why the same episodes admit this reading, and the discriminating
   observation.
 - **INCONSISTENT** pairs where neither statement is wrong on its face → record the
-  clash in both bodies' boundary-condition discussion and flag as an open problem.
-- The experiment queue is REPORT-ONLY — do not run experiments, do not write queue
-  files. It lives in the report; acting on it is Gregor's call.
+  clash in both bodies' boundary-condition discussion and mint a problem leaf
+  (`kind: contradiction` or `anomaly`) so the clash enters the ledger.
+- **WRITE THE LEDGER** — for each experiment designed in step 3: find the matching
+  problem stub in `kb:/problems/` (match on the involved ids; `kb problems list`),
+  fill its `experiment:` block (observation / where / outcomes / cost / decisiveness
+  — all fields, see `templates/problem.md.template`), flip `status: open → ready`,
+  bump `updated:`. No matching stub (e.g. a brand-new rival pair from this pass) →
+  create the problem leaf yourself from the template, born `ready`. Do NOT run any
+  experiment.
 - Then: `$KB_ENGINE_DIR/scripts/kb sync` and `$KB_ENGINE_DIR/scripts/validate.py`.
 
 ## Constraints
 
 - Criticism only — this pass never flips a model to `corroborated`, never adds
   `evidence_for`, and never deletes a model. Its outputs are attacks, rivals,
-  refutation flags, and the experiment queue.
+  refutation flags, and `ready` ledger items. It designs experiments; only
+  /run-experiment (with Gregor in the loop) runs them.
 - Attacks must be honest: a rival you wouldn't bet a lunch on, or a "criticism" the
   statement trivially answers, is padding — drop it.
 - Read transcripts only when a summary is genuinely ambiguous about whether it

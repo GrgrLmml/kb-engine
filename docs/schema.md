@@ -1,11 +1,12 @@
 # KB schema
 
-Four file shapes live in `kb-data/`:
+Five file shapes live in `kb-data/`:
 
 1. **Leaf entries** — one per filed conversation (episodic). Filename: `<YYYY-MM-DD>-<slug>.md`.
 2. **Recipes** — reusable procedures distilled from one or more conversations (evergreen, `type: recipe`). Filename: `<slug>.md` (no date prefix). Live under `kb:/recipes/`.
 3. **Models** — declarative claims about how something works (evergreen, `type: model`). Filename: `<slug>.md` (no date prefix). Live under `kb:/models/`.
-4. **`_route.md`** — one per folder. The folder index. Used by the retriever to traverse without loading leaves.
+4. **Problems** — the epistemic ledger: durable open conflicts, each carrying its pre-registered crucial experiment (`type: problem`). Filename: `<slug>.md`. Live under `kb:/problems/`.
+5. **`_route.md`** — one per folder. The folder index. Used by the retriever to traverse without loading leaves.
 
 All paths inside frontmatter use the **`kb:/` URI scheme**, rooted at the kb-data directory (e.g. `kb:/people/alex/_route.md`). Tooling resolves `kb:/` → `$KB_DATA_DIR/` at read time. The scheme makes it impossible to confuse with a filesystem path.
 
@@ -201,6 +202,65 @@ empty/`null` but the keys must be present.
 
 ---
 
+## Problem frontmatter (`type: problem`)
+
+Problems are the **epistemic ledger** — durable open conflicts in the theory layer,
+living under `kb:/problems/` with a lifecycle. `kb problems scan` mints stubs
+deterministically from `kb doctor` findings; `/criticize` designs the pre-registered
+crucial experiment and flips `open → ready`; `/run-experiment` makes the observation
+and flips `ready → resolved`. Resolution is the KB's growth metric.
+
+```yaml
+---
+type: problem
+id: rivals-model-a-vs-model-b         # evergreen slug; matches filename stem
+title: model-a vs model-b — undiscriminated rivals
+created: 2026-08-04T10:00:00Z
+updated: 2026-08-04T10:00:00Z
+status: open                          # open → ready → resolved | dropped
+kind: rivals                          # rivals | refuted-review | contradiction | anomaly | open-question
+fingerprint: "rivals:model-a|model-b" # deterministic key; scan reconciles on this
+models: [model-a, model-b]            # bare ids of the leaves this problem is about (indexed as edges)
+experiment:                           # null while open; required once ready
+  observation: >-
+    The ONE observation to make — written before anyone looks at data.
+  where: >-
+    Exact surface: Datadog query / BigQuery table / repo path / person.
+  outcomes:                           # pre-registered meaning of each result — the anti-post-hoc contract
+    - if: result A
+      then: model-a REFUTED; model-b corroborated
+    - if: result B
+      then: model-b refuted or narrowed to a boundary condition
+  cost: one Datadog session (~10 min)
+  decisiveness: high                  # high | medium | low — high kills a model whichever way it lands
+resolved_by: null                     # episode id of the filed experiment run (required once resolved)
+resolution: null                      # one line: who died / what narrowed
+topics: [gpu, capacity-planning]
+related: [kb:/models/model-a.md, kb:/models/model-b.md]
+sources: []
+summary: >-
+  What is unresolved and why it matters — WARM-tier self-contained.
+---
+
+Why this is a problem: what each side claims, which episodes ground each reading,
+what a resolution would change.
+```
+
+### Required fields
+
+`type` (always `problem`), `id`, `title`, `created`, `updated`, `status`, `kind`,
+`fingerprint`, `summary`. `models`, `experiment`, `resolved_by`, `resolution`,
+`topics`, `related`, `sources` may be empty/`null` but should be present.
+
+### Field semantics
+
+- **`fingerprint`**: The deterministic reconciliation key (`<kind>:<sorted ids>`). `kb problems scan` uses it to keep the ledger in sync with the doctor's findings without ever duplicating a problem — and to detect *inversions* (a problem marked resolved whose condition still fires).
+- **`experiment.outcomes`**: The load-bearing field. Pre-registering what each result *means* before looking at data is what prevents post-hoc rationalization; `/run-experiment` may only map observations onto these outcomes, never reinterpret. Ambiguous data means the experiment was under-designed — refine it, don't pick a winner.
+- **`status`**: `ready` requires a complete `experiment` block; `resolved` requires `resolved_by` (a filed episode — resolution without evidence is not resolution). `dropped` records a problem judged not worth an experiment; say why in `resolution`.
+- **`models`**: Bare ids of the models (or, for `contradiction` problems, entries) in tension. Indexed as edges, so `kb edges <model-id>` shows the open problems a model is entangled in.
+
+---
+
 ## `_route.md` frontmatter
 
 ```yaml
@@ -246,8 +306,8 @@ The retriever reads frontmatter to traverse; it reads the prose only when WARM-l
 ## Invariants
 
 - Every folder under `kb-data/` has exactly one `_route.md`.
-- Every leaf — episodic entry, recipe, **or model** — has its parent folder list it in that `_route.md`'s `entries`.
-- `id` is unique across the whole kb-data tree (recipe and model ids share the same namespace as entry ids).
+- Every leaf — episodic entry, recipe, model, **or problem** — has its parent folder list it in that `_route.md`'s `entries`.
+- `id` is unique across the whole kb-data tree (recipe, model, and problem ids share the same namespace as entry ids).
 - All paths in frontmatter use the `kb:/` URI scheme. External URLs (`https://`) keep their normal form. Bare ids (in `supersedes` / `contradicts` / `superseded_by`) are not paths and need no prefix.
 - All timestamps are ISO 8601 UTC.
 

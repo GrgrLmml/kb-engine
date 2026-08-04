@@ -19,6 +19,7 @@ Subcommands:
                    from the leaves (purpose/related/prose stay hand-curated)
   sync             reindex-routes + audit-topics --fix + index  (post-filing one-liner)
   doctor           staleness + referential-integrity report
+  problems         the epistemic ledger: scan | list | brief | resolve | drop
 
 The index lives at $KB_DATA_DIR/.index/kb.db (gitignored, disposable — rebuilt
 from the markdown at any time).
@@ -131,7 +132,7 @@ CREATE TABLE IF NOT EXISTS meta (
   path TEXT PRIMARY KEY,        -- kb:/ URI
   mtime REAL NOT NULL,
   id TEXT,
-  doctype TEXT NOT NULL,        -- entry | recipe | model | route
+  doctype TEXT NOT NULL,        -- entry | recipe | model | problem | route
   status TEXT,
   title TEXT,
   created TEXT,
@@ -145,7 +146,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(
 );
 CREATE TABLE IF NOT EXISTS edges (
   src TEXT NOT NULL,            -- source id
-  kind TEXT NOT NULL,           -- related|supersedes|superseded_by|contradicts|derived_from|evidence_for|refuted_by|rivals
+  kind TEXT NOT NULL,           -- related|supersedes|superseded_by|contradicts|derived_from|evidence_for|refuted_by|rivals|models
   target TEXT NOT NULL,         -- bare id, or kb:/ URI for related
   PRIMARY KEY (src, kind, target)
 );
@@ -167,6 +168,16 @@ def doc_fields(fm: dict, body: str, doctype: str) -> dict:
             extra_parts.append(fm[k])
     for k in ("steps", "decisions", "open_questions", "tools", "inputs", "predictions"):
         extra_parts.extend(lst(k))
+    if doctype == "problem":
+        extra_parts.append(str(fm.get("kind") or ""))
+        extra_parts.append(str(fm.get("resolution") or ""))
+        exp = fm.get("experiment")
+        if isinstance(exp, dict):
+            extra_parts.append(str(exp.get("observation") or ""))
+            extra_parts.append(str(exp.get("where") or ""))
+            for o in exp.get("outcomes") or []:
+                if isinstance(o, dict):
+                    extra_parts.append(f"{o.get('if') or ''} -> {o.get('then') or ''}")
     if doctype == "route":
         for sub in fm.get("subroutes") or []:
             if isinstance(sub, dict):
@@ -191,7 +202,7 @@ def index_edges(con: sqlite3.Connection, fm: dict) -> None:
         return
     con.execute("DELETE FROM edges WHERE src = ?", (src,))
     for kind in ("related", "supersedes", "contradicts", "derived_from",
-                 "evidence_for", "refuted_by", "rivals"):
+                 "evidence_for", "refuted_by", "rivals", "models"):
         for t in fm.get(kind) or []:
             if isinstance(t, str):
                 con.execute("INSERT OR IGNORE INTO edges VALUES (?,?,?)", (src, kind, t))
@@ -221,7 +232,8 @@ def cmd_index(args) -> int:
             continue  # invalid files are the validator's problem, not the index's
         doctype = ("route" if path.name == "_route.md"
                    else "recipe" if fm.get("type") == "recipe"
-                   else "model" if fm.get("type") == "model" else "entry")
+                   else "model" if fm.get("type") == "model"
+                   else "problem" if fm.get("type") == "problem" else "entry")
         d = doc_fields(fm, body, doctype)
         con.execute("DELETE FROM docs WHERE path = ?", (uri,))
         con.execute(
@@ -286,8 +298,10 @@ def cmd_search(args) -> int:
     elif not args.routes:
         sql += " AND m.doctype != 'route'"
     if not args.all_status:
-        # active/draft are the live leaf+recipe statuses; hypothesis/corroborated the live model ones
-        sql += " AND (m.status IN ('active','draft','hypothesis','corroborated') OR m.status IS NULL)"
+        # active/draft are the live leaf+recipe statuses; hypothesis/corroborated the
+        # live model ones; open/ready the live problem ones
+        sql += (" AND (m.status IN ('active','draft','hypothesis','corroborated',"
+                "'open','ready') OR m.status IS NULL)")
     for t in args.topic or []:
         sql += " AND (',' || replace(m.topics, ' ', '') || ',') LIKE ?"
         params.append(f"%,{t},%")
@@ -767,6 +781,297 @@ def cmd_doctor(args) -> int:
     return 1 if problems else 0
 
 
+# ------------------------------------------------------------------ problems
+#
+# The epistemic ledger: kb doctor *notices* open conflicts; problem leaves under
+# kb:/problems/ make them durable, with a lifecycle (open -> ready -> resolved |
+# dropped). /criticize upgrades a stub to `ready` by writing the pre-registered
+# crucial experiment; /run-experiment executes it and resolves. The CLI only does
+# the mechanical parts: reconciling doctor findings into stubs, listing, briefing,
+# and field edits at resolution time. Judgment stays with the LLM layer.
+
+PROBLEM_AGE_FMT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def problems_dir(root: Path) -> Path:
+    return root / "problems"
+
+
+def age_days(iso: object) -> int:
+    try:
+        return (datetime.now(timezone.utc)
+                - datetime.strptime(str(iso), PROBLEM_AGE_FMT)
+                .replace(tzinfo=timezone.utc)).days
+    except ValueError:
+        return -1
+
+
+def load_problems(root: Path) -> list[tuple[Path, dict, str]]:
+    d = problems_dir(root)
+    if not d.is_dir():
+        return []
+    out = []
+    for p in sorted(d.glob("*.md")):
+        if p.name == "_route.md":
+            continue
+        fm, body = parse_fm(p)
+        if fm and fm.get("type") == "problem":
+            out.append((p, fm, body))
+    return out
+
+
+def write_problem(path: Path, fm: dict, body: str) -> None:
+    """Fixed serializer for machine-managed problem leaves."""
+    fm_text = yaml.safe_dump(fm, sort_keys=False, allow_unicode=True,
+                             width=100, default_flow_style=False).strip()
+    path.write_text(f"---\n{fm_text}\n---\n\n{body.strip()}\n")
+
+
+def epistemic_findings(root: Path, con: sqlite3.Connection,
+                       model_max_age: int = 60) -> list[dict]:
+    """The doctor conditions that deserve a durable ledger entry.
+
+    Mirrors cmd_doctor's problem/needs-review/stale-model logic; returns
+    structured findings instead of printed lines.
+    """
+    live = {r[0]: r[1] for r in con.execute(
+        "SELECT id, status FROM meta WHERE id IS NOT NULL")}
+    live_model = {"hypothesis", "corroborated"}
+    live_entry = {"active", None}
+    findings: list[dict] = []
+    rival_ids: set[str] = set()
+    seen_pairs = set()
+    for src, target in con.execute(
+            "SELECT DISTINCT src, target FROM edges WHERE kind = 'rivals'"):
+        pair = tuple(sorted((src, target)))
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        if live.get(pair[0]) in live_model and live.get(pair[1]) in live_model:
+            rival_ids.update(pair)
+            findings.append({"kind": "rivals", "ids": list(pair),
+                             "fingerprint": f"rivals:{pair[0]}|{pair[1]}"})
+    for src, target in con.execute(
+            "SELECT DISTINCT src, target FROM edges WHERE kind = 'contradicts'"):
+        pair = tuple(sorted((src, target)))
+        if live.get(pair[0]) in live_entry and live.get(pair[1]) in live_entry:
+            fp = f"contradiction:{pair[0]}|{pair[1]}"
+            if fp not in {f["fingerprint"] for f in findings}:
+                findings.append({"kind": "contradiction", "ids": list(pair),
+                                 "fingerprint": fp})
+    for p in walk_md(root):
+        fm, _ = parse_fm(p)
+        if not fm or fm.get("type") != "model":
+            continue
+        mid = fm.get("id")
+        status = fm.get("status")
+        if status in live_model and fm.get("refuted_by"):
+            findings.append({"kind": "refuted-review", "ids": [mid],
+                             "fingerprint": f"refuted-review:{mid}"})
+        elif (status == "hypothesis" and not fm.get("evidence_for")
+              and mid not in rival_ids
+              and age_days(fm.get("created")) > model_max_age):
+            # a lone hypothesis sitting untested — /criticize owes it a rival
+            # and/or its riskiest-prediction experiment
+            findings.append({"kind": "open-question", "ids": [mid],
+                             "fingerprint": f"untested:{mid}"})
+    return findings
+
+
+def _stub_fields(root: Path, con: sqlite3.Connection, f: dict) -> tuple[str, str, str]:
+    """(slug, title, body) for a scan-minted stub."""
+    kind, ids = f["kind"], f["ids"]
+    if kind == "rivals":
+        slug = f"rivals-{ids[0]}-vs-{ids[1]}"
+        title = f"{ids[0]} vs {ids[1]} — undiscriminated rivals"
+    elif kind == "contradiction":
+        slug = f"contradiction-{ids[0]}-vs-{ids[1]}"
+        title = f"{ids[0]} contradicts {ids[1]} — unresolved"
+    elif kind == "refuted-review":
+        slug = f"refuted-review-{ids[0]}"
+        title = f"{ids[0]} carries refutation evidence — refute or narrow"
+    else:
+        slug = f"untested-{ids[0]}"
+        title = f"{ids[0]} is an untested lone hypothesis"
+    lines = ["Minted by `kb problems scan` from a standing `kb doctor` finding.", ""]
+    for i in ids:
+        row = con.execute("SELECT path, status FROM meta WHERE id = ?", (i,)).fetchone()
+        claim = ""
+        if row:
+            fm, _ = parse_fm(from_kb_uri(root, row[0]))
+            claim = first_line((fm or {}).get("statement") or (fm or {}).get("summary"), 200)
+        lines.append(f"- **{i}**" + (f" ({row[1]})" if row and row[1] else "") +
+                     (f": {claim}" if claim else ""))
+    lines += ["",
+              "Next: `/criticize` designs the crucial experiment (pre-registered "
+              "observation + outcomes) and upgrades this problem to `ready`; "
+              "`/run-experiment` executes it."]
+    return slug, title, "\n".join(lines)
+
+
+def ensure_problems_route(root: Path) -> None:
+    d = problems_dir(root)
+    d.mkdir(exist_ok=True)
+    rp = d / "_route.md"
+    if rp.exists():
+        return
+    rp.write_text(f"""---
+type: route
+folder: kb:/problems
+title: Problems
+purpose: The epistemic ledger — open conflicts in the theory layer (undiscriminated rivals, refutation evidence, contradictions), each carrying its pre-registered crucial experiment once /criticize has designed it. Resolution is the KB's growth metric.
+last_indexed: {now_iso()}
+topics: []
+subroutes: []
+entries: []
+related:
+  - kb:/models/_route.md
+---
+
+# Problems
+
+Stubs are minted deterministically by `kb problems scan` from `kb doctor` findings;
+`/criticize` upgrades them to `ready` with a pre-registered experiment;
+`/run-experiment` runs the observation and resolves them. Never resolve without a
+filed episode as evidence.
+""")
+
+
+def cmd_problems(args) -> int:
+    root = kb_root()
+    con = ensure_index(root)
+    action = args.action
+
+    if action == "scan":
+        findings = epistemic_findings(root, con, model_max_age=args.model_max_age)
+        existing = {fm.get("fingerprint"): (p, fm) for p, fm, _ in load_problems(root)}
+        created, inversions, cleared = 0, 0, 0
+        if findings:
+            ensure_problems_route(root)
+        for f in findings:
+            hit = existing.get(f["fingerprint"])
+            if hit is None:
+                slug, title, body = _stub_fields(root, con, f)
+                path = problems_dir(root) / f"{slug}.md"
+                if path.exists():
+                    print(f"  SKIP {slug}: file exists without matching fingerprint",
+                          file=sys.stderr)
+                    continue
+                topics: list[str] = []
+                for i in f["ids"]:
+                    row = con.execute("SELECT topics FROM meta WHERE id = ?", (i,)).fetchone()
+                    for t in (row[0] if row else "").split(","):
+                        t = t.strip()
+                        if t and t not in topics and len(topics) < 8:
+                            topics.append(t)
+                related = []
+                for i in f["ids"]:
+                    row = con.execute("SELECT path FROM meta WHERE id = ?", (i,)).fetchone()
+                    if row:
+                        related.append(row[0])
+                write_problem(path, {
+                    "type": "problem", "id": slug, "title": title,
+                    "created": now_iso(), "updated": now_iso(),
+                    "status": "open", "kind": f["kind"],
+                    "fingerprint": f["fingerprint"], "models": f["ids"],
+                    "experiment": None, "resolved_by": None, "resolution": None,
+                    "topics": topics, "related": related, "sources": [],
+                    "summary": f"{title}. Standing doctor finding made durable; "
+                               f"needs a pre-registered crucial experiment "
+                               f"(/criticize), then /run-experiment.",
+                }, body)
+                created += 1
+                print(f"  minted {slug} ({f['kind']})")
+            elif hit[1].get("status") in ("resolved", "dropped"):
+                inversions += 1
+                print(f"  INVERSION {hit[1].get('id')}: marked "
+                      f"{hit[1].get('status')} but the doctor condition still fires — "
+                      f"the resolution didn't take, or edges weren't updated")
+        firing = {f["fingerprint"] for f in findings}
+        for p, fm, _ in load_problems(root):
+            if fm.get("status") in ("open", "ready") and fm.get("fingerprint") not in firing:
+                cleared += 1
+                print(f"  cleared {fm.get('id')}: condition no longer fires — "
+                      f"resolve it with the episode that settled it, or drop it")
+        if created:
+            cmd_reindex_routes(argparse.Namespace(dry_run=False))
+            cmd_index(argparse.Namespace(rebuild=False, quiet=True))
+        print(f"kb problems scan: {len(findings)} finding(s), {created} minted, "
+              f"{inversions} inversion(s), {cleared} cleared")
+        return 0
+
+    probs = load_problems(root)
+
+    if action == "list":
+        rows = [(p, fm) for p, fm, _ in probs
+                if not args.status or fm.get("status") == args.status]
+        if not rows:
+            print("no problems" + (f" with status {args.status}" if args.status else ""))
+            return 0
+        counts: dict[str, int] = {}
+        for _, fm, _ in probs:
+            counts[str(fm.get("status"))] = counts.get(str(fm.get("status")), 0) + 1
+        for p, fm in rows:
+            exp = fm.get("experiment") or {}
+            extra = ""
+            if fm.get("status") == "ready" and isinstance(exp, dict):
+                extra = f"  [{exp.get('decisiveness', '?')}/{first_line(exp.get('cost'), 40)}]"
+            if fm.get("status") == "resolved":
+                extra = f"  -> {first_line(fm.get('resolution'), 60)}"
+            print(f"  {fm.get('status'):<9} {age_days(fm.get('created')):>4}d  "
+                  f"{fm.get('kind'):<14} {fm.get('id')}{extra}")
+        print("totals: " + " · ".join(f"{v} {k}" for k, v in sorted(counts.items())))
+        return 0
+
+    if action == "brief":
+        live = [(p, fm) for p, fm, _ in probs if fm.get("status") in ("open", "ready")]
+        if not live:
+            return 0
+        ready = [(p, fm) for p, fm in live if fm.get("status") == "ready"]
+        oldest = max(age_days(fm.get("created")) for _, fm in live)
+        resolved_30d = sum(1 for _, fm, _ in probs
+                           if fm.get("status") == "resolved"
+                           and 0 <= age_days(fm.get("updated")) <= 30)
+        print(f"OPEN PROBLEMS (theory layer): {len(live) - len(ready)} open · "
+              f"{len(ready)} ready to run · oldest {oldest}d · "
+              f"{resolved_30d} resolved in last 30d")
+        for _, fm in sorted(ready, key=lambda x: age_days(x[1].get("created")),
+                            reverse=True):
+            exp = fm.get("experiment") or {}
+            print(f"  READY {fm.get('id')} ({age_days(fm.get('created'))}d, "
+                  f"{exp.get('decisiveness', '?')}/{first_line(exp.get('cost'), 40)}): "
+                  f"{first_line(exp.get('observation'), 140)}")
+        if ready:
+            print(f"  Run one now: /run-experiment <id>")
+        else:
+            print("  No experiments designed yet — /criticize turns open problems "
+                  "into ready ones.")
+        return 0
+
+    if action in ("resolve", "drop"):
+        hits = [(p, fm, body) for p, fm, body in probs if fm.get("id") == args.id]
+        if not hits:
+            sys.exit(f"kb problems: no problem with id '{args.id}'")
+        p, fm, body = hits[0]
+        if action == "resolve":
+            if not args.by:
+                sys.exit("kb problems resolve: --by <episode-id> is required "
+                         "(resolution without filed evidence is not resolution)")
+            if not con.execute("SELECT 1 FROM meta WHERE id = ?", (args.by,)).fetchone():
+                sys.exit(f"kb problems resolve: --by '{args.by}' is not a KB id")
+            fm.update(status="resolved", resolved_by=args.by,
+                      resolution=args.note or None, updated=now_iso())
+        else:
+            fm.update(status="dropped", resolution=args.note or None, updated=now_iso())
+        write_problem(p, fm, body)
+        cmd_index(argparse.Namespace(rebuild=False, quiet=True))
+        print(f"kb problems: {fm.get('id')} -> {fm['status']}"
+              + (f" (by {args.by})" if action == "resolve" else ""))
+        return 0
+
+    sys.exit(f"kb problems: unknown action {action!r}")
+
+
 # ---------------------------------------------------------------------- main
 
 def main() -> int:
@@ -782,7 +1087,7 @@ def main() -> int:
     p = sub.add_parser("search", help="BM25 full-text search")
     p.add_argument("query", nargs="+")
     p.add_argument("-n", type=int, default=10, help="max hits (default 10)")
-    p.add_argument("--type", choices=["entry", "recipe", "model", "route", "all"], default="all")
+    p.add_argument("--type", choices=["entry", "recipe", "model", "problem", "route", "all"], default="all")
     p.add_argument("--topic", action="append", help="require a topic tag (repeatable)")
     p.add_argument("--person", action="append", help="require a participant (repeatable)")
     p.add_argument("--all-status", action="store_true",
@@ -815,6 +1120,16 @@ def main() -> int:
     p = sub.add_parser("sync", help="reindex-routes + audit-topics --fix + index")
     p.add_argument("--quiet", action="store_true")
     p.set_defaults(fn=cmd_sync)
+
+    p = sub.add_parser("problems", help="the epistemic ledger (scan/list/brief/resolve/drop)")
+    p.add_argument("action", choices=["scan", "list", "brief", "resolve", "drop"])
+    p.add_argument("id", nargs="?", help="problem id (resolve/drop)")
+    p.add_argument("--status", help="filter (list)")
+    p.add_argument("--by", help="episode id holding the evidence (resolve)")
+    p.add_argument("--note", help="one-line resolution note (resolve/drop)")
+    p.add_argument("--model-max-age", type=int, default=60,
+                   help="days before a lone untested hypothesis becomes a problem (scan)")
+    p.set_defaults(fn=cmd_problems)
 
     p = sub.add_parser("doctor", help="staleness + referential integrity report")
     p.add_argument("--recipe-max-age", type=int, default=90,

@@ -77,6 +77,20 @@ MODEL_OPTIONAL_PRESENT = {
 }
 MODEL_ALL = MODEL_REQUIRED | MODEL_OPTIONAL_PRESENT
 
+# Problems are the epistemic ledger (type: problem, kb:/problems/) — durable
+# doctor findings with a lifecycle. `ready` means a pre-registered crucial
+# experiment is attached; `resolved` requires a filed episode as evidence.
+PROBLEM_REQUIRED = {"type", "id", "title", "created", "updated", "status",
+                    "kind", "fingerprint", "summary"}
+PROBLEM_OPTIONAL_PRESENT = {
+    "models", "experiment", "resolved_by", "resolution",
+    "topics", "related", "sources",
+}
+PROBLEM_ALL = PROBLEM_REQUIRED | PROBLEM_OPTIONAL_PRESENT
+PROBLEM_VALID_STATUS = {"open", "ready", "resolved", "dropped"}
+PROBLEM_VALID_KIND = {"rivals", "refuted-review", "contradiction",
+                      "anomaly", "open-question"}
+
 VALID_STATUS = {"active", "superseded", "archived"}
 RECIPE_VALID_STATUS = {"active", "draft", "superseded"}
 # Model statuses are Popperian: a model is never proven, only corroborated
@@ -93,6 +107,7 @@ class Validator:
     entries: dict[Path, dict] = field(default_factory=dict)  # episodic leaf path -> frontmatter
     recipes: dict[Path, dict] = field(default_factory=dict)  # recipe leaf path -> frontmatter
     models: dict[Path, dict] = field(default_factory=dict)   # model leaf path -> frontmatter
+    problems: dict[Path, dict] = field(default_factory=dict)  # problem leaf path -> frontmatter
 
     def err(self, path: Path, msg: str) -> None:
         self.errors.append((path, msg))
@@ -381,6 +396,95 @@ class Validator:
         if isinstance(summary, str) and len(summary.strip()) < 20:
             self.err(file, f"summary too short ({len(summary.strip())} chars) — make it WARM-tier useful")
 
+    # ----------------------------------------------------------- problem checks
+
+    def validate_problem(self, file: Path, fm: dict) -> None:
+        self.problems[file] = fm
+
+        missing = PROBLEM_REQUIRED - set(fm.keys())
+        if missing:
+            self.err(file, f"missing required problem fields: {sorted(missing)}")
+        self.check_unknown_keys(file, fm, PROBLEM_ALL, "problem")
+
+        if fm.get("type") != "problem":
+            self.err(file, f"type must be 'problem', got: {fm.get('type')!r}")
+
+        # id matches filename stem; ids unique tree-wide
+        expected_id = file.stem
+        actual_id = fm.get("id")
+        if isinstance(actual_id, str):
+            if actual_id != expected_id:
+                self.err(file, f"id={actual_id!r} doesn't match filename stem {expected_id!r}")
+            if actual_id in self.ids_seen and self.ids_seen[actual_id] != file:
+                self.err(file, f"duplicate id {actual_id!r} (also at {self.ids_seen[actual_id]})")
+            else:
+                self.ids_seen[actual_id] = file
+
+        status = fm.get("status")
+        if "status" in fm and status not in PROBLEM_VALID_STATUS:
+            self.err(file, f"problem status must be one of {sorted(PROBLEM_VALID_STATUS)}, got {status!r}")
+        if "kind" in fm and fm.get("kind") not in PROBLEM_VALID_KIND:
+            self.err(file, f"problem kind must be one of {sorted(PROBLEM_VALID_KIND)}, got {fm.get('kind')!r}")
+
+        fp = fm.get("fingerprint")
+        if "fingerprint" in fm and (not isinstance(fp, str) or not fp.strip()):
+            self.err(file, "fingerprint must be a non-empty string")
+
+        for f_name in ("created", "updated"):
+            if f_name in fm:
+                self.check_iso_utc(file, f_name, fm[f_name])
+
+        # models: bare ids of the leaves this problem is about
+        for v in fm.get("models") or []:
+            if not isinstance(v, str) or v.startswith("kb:/") or v.startswith("http"):
+                self.err(file, f"models[] should be a bare id, got: {v!r}")
+
+        # experiment: null while open; `ready` requires the pre-registered block
+        exp = fm.get("experiment")
+        if exp is not None and not isinstance(exp, dict):
+            self.err(file, "experiment must be null or a mapping")
+        if status == "ready":
+            if not isinstance(exp, dict):
+                self.err(file, "status 'ready' requires an experiment block")
+            else:
+                obs = exp.get("observation")
+                if not isinstance(obs, str) or len(obs.strip()) < 10:
+                    self.err(file, "experiment.observation must be a substantive string")
+                where = exp.get("where")
+                if not isinstance(where, str) or len(where.strip()) < 5:
+                    self.err(file, "experiment.where must name the exact surface to look at")
+                outcomes = exp.get("outcomes")
+                if not isinstance(outcomes, list) or not outcomes:
+                    self.err(file, "experiment.outcomes must be a non-empty list")
+                else:
+                    for o in outcomes:
+                        if not isinstance(o, dict) or "if" not in o or "then" not in o:
+                            self.err(file, f"experiment.outcomes[] needs 'if' and 'then': {o!r}")
+                dec = exp.get("decisiveness")
+                if dec is not None and dec not in ("high", "medium", "low"):
+                    self.err(file, f"experiment.decisiveness must be high/medium/low, got {dec!r}")
+
+        # resolved requires filed evidence
+        if status == "resolved":
+            rb = fm.get("resolved_by")
+            if not isinstance(rb, str) or not rb.strip():
+                self.err(file, "status 'resolved' requires resolved_by (episode id)")
+            elif rb.startswith("kb:/") or rb.startswith("http"):
+                self.err(file, f"resolved_by should be a bare id, got: {rb!r}")
+
+        # related: kb:/ paths to existing files
+        for v in fm.get("related") or []:
+            self.check_kb_path(file, "related[]", v)
+
+        # sources: http(s)/gs:// URLs
+        for v in fm.get("sources") or []:
+            if not isinstance(v, str) or not v.startswith(("http://", "https://", "gs://")):
+                self.err(file, f"sources[] not an http(s)/gs:// URL: {v!r}")
+
+        summary = fm.get("summary")
+        if isinstance(summary, str) and len(summary.strip()) < 20:
+            self.err(file, f"summary too short ({len(summary.strip())} chars) — make it WARM-tier useful")
+
     # ------------------------------------------------------------- route checks
 
     def validate_route(self, file: Path, fm: dict) -> None:
@@ -434,7 +538,8 @@ class Validator:
 
     def validate_crosslinks(self) -> None:
         # Every leaf (episodic entry, recipe, or model) must appear in its parent _route.md's entries[]
-        for entry_path, entry_fm in {**self.entries, **self.recipes, **self.models}.items():
+        for entry_path, entry_fm in {**self.entries, **self.recipes,
+                                     **self.models, **self.problems}.items():
             parent_route = entry_path.parent / "_route.md"
             if parent_route not in self.routes:
                 self.err(entry_path, f"parent folder has no _route.md at {parent_route}")
@@ -502,6 +607,8 @@ def main() -> int:
             v.validate_recipe(path, fm)
         elif fm.get("type") == "model":
             v.validate_model(path, fm)
+        elif fm.get("type") == "problem":
+            v.validate_problem(path, fm)
         else:
             v.validate_entry(path, fm)
 
@@ -520,7 +627,8 @@ def main() -> int:
 
     if not args.quiet:
         print(f"ok: {file_count} files, {len(v.routes)} routes, {len(v.entries)} entries, "
-              f"{len(v.recipes)} recipes, {len(v.models)} models — schema clean")
+              f"{len(v.recipes)} recipes, {len(v.models)} models, "
+              f"{len(v.problems)} problems — schema clean")
     return 0
 
 

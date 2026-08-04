@@ -29,16 +29,14 @@ command -v uv >/dev/null 2>&1 || exit 0
 INDEX="$(KB_DATA_DIR="$KB_DATA_DIR" "$KB_ENGINE_DIR/scripts/kb" routes --compact 2>/dev/null)" || exit 0
 [ -n "$INDEX" ] || exit 0
 
-# Epistemic problem queue: kb doctor's open conflicts (unresolved contradictions,
-# undiscriminated rivals, untested hypotheses). Deterministic and cheap — surfacing
-# it ambiently lets the session suggest /theorize or /criticize when warranted.
-# doctor exits non-zero when it finds anything, so don't let that kill the hook.
-PROBLEMS="$(KB_DATA_DIR="$KB_DATA_DIR" "$KB_ENGINE_DIR/scripts/kb" doctor 2>/dev/null \
-  | grep -E '^  (problem|needs-review|stale-model) ')" || PROBLEMS=""
+# Epistemic problem ledger: durable open conflicts under kb:/problems/, with
+# lifecycle counts and any ready-to-run experiments. Deterministic and cheap —
+# surfacing it ambiently lets the session suggest /criticize (design experiments)
+# or /run-experiment (resolve one) when warranted. Empty output when no live problems.
+PROBLEMS="$(KB_DATA_DIR="$KB_DATA_DIR" "$KB_ENGINE_DIR/scripts/kb" problems brief 2>/dev/null)" || PROBLEMS=""
 if [ -n "$PROBLEMS" ]; then
   INDEX="$INDEX
 
-OPEN PROBLEMS (theory layer — conjecture fuel; suggest /theorize or /criticize when the conversation touches these):
 $PROBLEMS"
 fi
 
