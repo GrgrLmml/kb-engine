@@ -40,6 +40,16 @@ if [ -n "$PROBLEMS" ]; then
 $PROBLEMS"
 fi
 
+# Nightly librarian digest: inject while fresh (<24h) so overnight results reach
+# the owner without a new surface to check. Written by scripts/librarian-nightly.
+DIGEST="$KB_DATA_DIR/.librarian/digest.md"
+if [ -f "$DIGEST" ] && [ -n "$(find "$DIGEST" -mtime -1 2>/dev/null)" ]; then
+  INDEX="$INDEX
+
+LIBRARIAN DIGEST (overnight run):
+$(cat "$DIGEST")"
+fi
+
 # Hard cap so a runaway corpus can never flood the context (~15k tokens).
 MAXCHARS=60000
 if [ "${#INDEX}" -gt "$MAXCHARS" ]; then

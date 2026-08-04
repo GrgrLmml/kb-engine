@@ -1,0 +1,195 @@
+#!/bin/bash
+# librarian-nightly — deterministic nightly KB maintenance (zero tokens).
+#
+# Designed to run from launchd/cron at ~03:30. Every run:
+#   1. validates the schema
+#   2. auto-commits kb-data (safety net — commits even on validator errors;
+#      an autosave that withholds safety on bad days is no safety)
+#   3. kb sync   (route reindex + topic normalization + search index —
+#      this subsumes the old per-session normalize-topics SessionEnd hook)
+#   4. kb doctor snapshot + delta vs the previous run
+#   5. kb problems scan (ledger reconciliation)
+#   6. rotates .librarian/log (>30d deleted)
+#   7. writes .librarian/digest.md (injected into the next session's ambient
+#      context while <24h old)
+#   8. at most ONE headless claude pass, by calendar:
+#        Sunday          -> librarian criticize   (WIP-gated: skipped while the
+#                           ledger already holds >=6 `ready` experiments — the
+#                           critic throttles itself to resolution bandwidth)
+#        1st of month    -> librarian dedup kb:/
+#        15th of month   -> librarian mine-recipes
+#
+# Deliberately NOT scheduled: /theorize. Generation is not the bottleneck;
+# resolution is. The digest suggests /theorize only when the ledger runs dry.
+#
+# Usage: librarian-nightly [--no-headless] [--dry-run]
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+: "${KB_ENGINE_DIR:=$(dirname "$SCRIPT_DIR")}"
+: "${KB_DATA_DIR:=$KB_ENGINE_DIR/kb-data}"
+
+KB="$KB_ENGINE_DIR/scripts/kb"
+LOCKDIR="$KB_DATA_DIR/.librarian.lock"
+STATE_DIR="$KB_DATA_DIR/.librarian"
+LOG_DIR="$STATE_DIR/log"
+DIGEST="$STATE_DIR/digest.md"
+READY_WIP_LIMIT=6
+
+NO_HEADLESS=0
+DRY_RUN=0
+for a in "$@"; do
+  case "$a" in
+    --no-headless) NO_HEADLESS=1 ;;
+    --dry-run) DRY_RUN=1 ;;
+    *) echo "unknown arg: $a" >&2; exit 2 ;;
+  esac
+done
+
+mkdir -p "$STATE_DIR" "$LOG_DIR"
+
+# --- lock (same contract as scripts/librarian: atomic mkdir + dead-PID takeover)
+acquire_lock() {
+  local elapsed=0
+  while ! mkdir "$LOCKDIR" 2>/dev/null; do
+    if [ -f "$LOCKDIR/pid" ]; then
+      local p; p=$(cat "$LOCKDIR/pid" 2>/dev/null || true)
+      if [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null; then
+        rm -rf "$LOCKDIR"; continue
+      fi
+    fi
+    if [ $elapsed -ge 300 ]; then
+      echo "librarian-nightly: lock held after 300s — skipping this run" >&2
+      exit 1
+    fi
+    sleep 5; elapsed=$((elapsed + 5))
+  done
+  echo $$ > "$LOCKDIR/pid"
+  trap 'rm -rf "$LOCKDIR"' EXIT
+}
+acquire_lock
+
+TODAY="$(date -u +%Y-%m-%d)"
+NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# --- 1. validate ----------------------------------------------------------
+VALIDATE_OUT="$(uv run --quiet "$KB_ENGINE_DIR/scripts/validate.py" 2>&1)" \
+  && VALIDATE_LINE="clean" \
+  || VALIDATE_LINE="$(printf '%s\n' "$VALIDATE_OUT" | tail -1)"
+
+# --- 2. auto-commit kb-data ------------------------------------------------
+COMMIT_LINE="kb-data is not a git repo"
+if [ -d "$KB_DATA_DIR/.git" ]; then
+  cd "$KB_DATA_DIR"
+  NDIRTY="$(git status --porcelain | wc -l | tr -d ' ')"
+  if [ "$NDIRTY" = 0 ]; then
+    COMMIT_LINE="nothing to commit"
+  elif [ "$DRY_RUN" = 1 ]; then
+    COMMIT_LINE="would commit $NDIRTY file(s) (dry run)"
+  else
+    git add -A
+    # --no-verify: the pre-commit validator already ran above; an autosave must
+    # never be blocked by the errors it is reporting
+    if git commit -q --no-verify \
+        -m "kb autosave $TODAY: $NDIRTY file(s) (validator: $VALIDATE_LINE)"; then
+      COMMIT_LINE="$(git log -1 --format='%h') — $NDIRTY file(s)"
+    else
+      COMMIT_LINE="commit FAILED"
+    fi
+  fi
+fi
+
+# --- 3. sync ---------------------------------------------------------------
+SYNC_OUT="$("$KB" sync --quiet 2>&1 | tail -2)" || SYNC_OUT="kb sync FAILED: $SYNC_OUT"
+
+# --- 4. doctor snapshot + delta --------------------------------------------
+DOCTOR_NEW="$STATE_DIR/doctor-latest.txt"
+DOCTOR_PREV="$STATE_DIR/doctor-prev.txt"
+[ -f "$DOCTOR_NEW" ] && mv "$DOCTOR_NEW" "$DOCTOR_PREV"
+"$KB" doctor > "$DOCTOR_NEW" 2>&1 || true
+if [ -f "$DOCTOR_PREV" ]; then
+  NEW_FINDINGS="$(comm -13 <(sort "$DOCTOR_PREV") <(sort "$DOCTOR_NEW") | grep '^  ' || true)"
+  CLEARED_FINDINGS="$(comm -23 <(sort "$DOCTOR_PREV") <(sort "$DOCTOR_NEW") | grep '^  ' || true)"
+else
+  NEW_FINDINGS="$(grep '^  ' "$DOCTOR_NEW" || true)"
+  CLEARED_FINDINGS=""
+fi
+NFINDINGS="$(grep -c '^  ' "$DOCTOR_NEW" || true)"
+
+# --- 5. problems scan -------------------------------------------------------
+SCAN_OUT="$("$KB" problems scan 2>&1 | tail -1)" || SCAN_OUT="problems scan FAILED"
+BRIEF_OUT="$("$KB" problems brief 2>&1)" || BRIEF_OUT=""
+
+# --- 6. log rotation --------------------------------------------------------
+NROT="$(find "$LOG_DIR" -name '*.md' -mtime +30 2>/dev/null | wc -l | tr -d ' ')"
+[ "$DRY_RUN" = 1 ] || find "$LOG_DIR" -name '*.md' -mtime +30 -delete 2>/dev/null
+
+# --- 8 (decided before 7 so the digest can report it): one headless pass ----
+HEADLESS_LINE="none scheduled"
+DOW="$(date +%u)"   # 1=Mon .. 7=Sun
+DOM="$(date +%d)"
+MODE=""
+if [ "$DOW" = 7 ]; then
+  NREADY="$("$KB" problems list --status ready 2>/dev/null | grep -c '^  ready' || true)"
+  if [ "${NREADY:-0}" -ge "$READY_WIP_LIMIT" ]; then
+    HEADLESS_LINE="criticize SKIPPED — $NREADY experiments already ready (WIP limit $READY_WIP_LIMIT); run /run-experiment first"
+  else
+    MODE="criticize"
+  fi
+elif [ "$DOM" = "01" ]; then
+  MODE="dedup"
+elif [ "$DOM" = "15" ]; then
+  MODE="mine-recipes"
+fi
+if [ -n "$MODE" ]; then
+  if [ "$NO_HEADLESS" = 1 ] || [ "$DRY_RUN" = 1 ]; then
+    HEADLESS_LINE="$MODE would run (suppressed)"
+  elif ! command -v "${CLAUDE_BIN:-claude}" >/dev/null 2>&1; then
+    HEADLESS_LINE="$MODE SKIPPED — claude binary not on PATH"
+  else
+    # scripts/librarian re-acquires the same lock; release ours around the call
+    rm -rf "$LOCKDIR"
+    if [ "$MODE" = "criticize" ] || [ "$MODE" = "mine-recipes" ]; then
+      "$KB_ENGINE_DIR/scripts/librarian" "$MODE" --session-id "nightly-$TODAY" \
+        && HEADLESS_LINE="$MODE ran — see .librarian/log/" \
+        || HEADLESS_LINE="$MODE FAILED — see .librarian/log/"
+    else
+      "$KB_ENGINE_DIR/scripts/librarian" dedup kb:/ --session-id "nightly-$TODAY" \
+        && HEADLESS_LINE="dedup ran — see .librarian/log/" \
+        || HEADLESS_LINE="dedup FAILED — see .librarian/log/"
+    fi
+    acquire_lock
+  fi
+fi
+
+# --- 7. digest ---------------------------------------------------------------
+{
+  echo "# librarian digest — $NOW"
+  echo
+  echo "- kb-data autosave: $COMMIT_LINE"
+  echo "- validator: $VALIDATE_LINE"
+  echo "- doctor: ${NFINDINGS:-0} finding(s) standing"
+  echo "- $SCAN_OUT"
+  echo "- headless pass: $HEADLESS_LINE"
+  echo "- log rotation: $NROT file(s) removed"
+  if [ -n "$NEW_FINDINGS" ]; then
+    echo
+    echo "## new doctor findings since last run"
+    printf '%s\n' "$NEW_FINDINGS"
+  fi
+  if [ -n "$CLEARED_FINDINGS" ]; then
+    echo
+    echo "## cleared since last run"
+    printf '%s\n' "$CLEARED_FINDINGS"
+  fi
+  if [ -n "$BRIEF_OUT" ]; then
+    echo
+    printf '%s\n' "$BRIEF_OUT"
+  else
+    echo
+    echo "Problem ledger is empty — if open questions are piling up in entries, /theorize can harvest them."
+  fi
+} > "$DIGEST"
+
+echo "librarian-nightly: done ($NOW) — autosave: $COMMIT_LINE; doctor: ${NFINDINGS:-0}; headless: $HEADLESS_LINE"

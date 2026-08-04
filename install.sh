@@ -3,9 +3,10 @@
 #
 # Global install: symlinks the slash commands into ~/.claude/commands, writes
 # KB_ENGINE_DIR / KB_DATA_DIR into ~/.claude/settings.json (so commands,
-# scripts, and hooks resolve their paths), registers the SessionEnd
-# topic-normalization hook, bootstraps an empty kb-data, and installs the
-# git pre-commit validator.
+# scripts, and hooks resolve their paths), registers the SessionStart
+# ambient-index hook, installs the nightly librarian launchd agent (validate +
+# autosave + sync + doctor delta + problems scan + digest), bootstraps an
+# empty kb-data, and installs the git pre-commit validator.
 #
 # Usage:
 #   ./install.sh [--kb-data PATH] [--yes] [--uninstall]
@@ -113,6 +114,11 @@ PYEOF
   if [ -L "$pc" ]; then rm -f "$pc"; ok "removed pre-commit hook"; fi
   pcl="$KB_ENGINE_DIR/.git/hooks/pre-commit"
   if [ -L "$pcl" ]; then rm -f "$pcl"; ok "removed engine pre-commit leak guard"; fi
+  plist="$HOME/Library/LaunchAgents/com.kb-engine.librarian-nightly.plist"
+  if [ -f "$plist" ]; then
+    launchctl unload "$plist" 2>/dev/null || true
+    rm -f "$plist"; ok "removed nightly librarian launchd agent"
+  fi
   echo "Done."
   exit 0
 fi
@@ -207,9 +213,10 @@ if [ -z "$PY" ]; then warn "python3 unavailable — skipping settings edit; set 
   do_it=1
   if [ "$ASSUME_YES" != 1 ]; then
     if [ -t 0 ]; then
-      say "Will set env.KB_ENGINE_DIR, env.KB_DATA_DIR, register the SessionEnd"
-      say "topic-normalization hook, the SessionStart ambient-index hook, the"
-      say "PreToolUse permission hook (auto-allows read-only kb queries), AND"
+      say "Will set env.KB_ENGINE_DIR, env.KB_DATA_DIR, register the"
+      say "SessionStart ambient-index hook (removing any stale SessionEnd"
+      say "normalize hook), the PreToolUse permission hook (auto-allows"
+      say "read-only kb queries), AND"
       say "permission allow rules for the kb scripts + kb-data as an additional"
       say "working directory in $SETTINGS (existing keys preserved)."
       printf "  Proceed? [y/N] "; read -r ans; [ "$ans" = y ] || [ "$ans" = Y ] || do_it=0
@@ -226,9 +233,15 @@ d = json.load(open(p))
 d.setdefault("env", {})["KB_ENGINE_DIR"] = mech
 d["env"]["KB_DATA_DIR"] = data
 hooks = d.setdefault("hooks", {})
-se = hooks.setdefault("SessionEnd", [])
-if not any(h.get("command") == hook for g in se for h in g.get("hooks", [])):
-    se.append({"hooks": [{"type": "command", "command": hook, "async": True, "timeout": 30}]})
+# The per-session SessionEnd normalize hook is retired: nightly `kb sync` (via
+# scripts/librarian-nightly) does the same work once a day. Drop a stale
+# registration if a previous install left one behind.
+se = hooks.get("SessionEnd", [])
+for grp in se:
+    grp["hooks"] = [h for h in grp.get("hooks", []) if h.get("command") != hook]
+hooks["SessionEnd"] = [g for g in se if g.get("hooks")]
+if not hooks["SessionEnd"]:
+    hooks.pop("SessionEnd", None)
 ss = hooks.setdefault("SessionStart", [])
 if not any(h.get("command") == start_hook for g in ss for h in g.get("hooks", [])):
     # matcher: only fresh contexts — a resumed session already has the index
@@ -281,8 +294,59 @@ if [ -d "$KB_ENGINE_DIR/.git" ]; then
 fi
 echo
 
-# --- 6. search index ------------------------------------------------------
-echo "6. Search index…"
+# --- 6. nightly librarian (launchd, macOS only) ---------------------------
+echo "6. Nightly librarian…"
+PLIST_LABEL="com.kb-engine.librarian-nightly"
+PLIST="$HOME/Library/LaunchAgents/$PLIST_LABEL.plist"
+if [ "$(uname)" = "Darwin" ]; then
+  do_plist=1
+  if [ "$ASSUME_YES" != 1 ]; then
+    if [ -t 0 ]; then
+      say "Will install a launchd agent that runs scripts/librarian-nightly at"
+      say "03:30 daily: validates, auto-commits kb-data, kb sync, doctor delta,"
+      say "problems scan, log rotation, digest — plus one weekly headless"
+      say "criticize pass (WIP-gated) and monthly dedup/mine-recipes."
+      printf "  Install nightly agent? [y/N] "; read -r ans; [ "$ans" = y ] || [ "$ans" = Y ] || do_plist=0
+    else
+      do_plist=0; warn "non-interactive and no --yes; skipping nightly agent"
+    fi
+  fi
+  if [ "$do_plist" = 1 ]; then
+    mkdir -p "$HOME/Library/LaunchAgents"
+    cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$PLIST_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$KB_ENGINE_DIR/scripts/librarian-nightly</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>KB_ENGINE_DIR</key><string>$KB_ENGINE_DIR</string>
+    <key>KB_DATA_DIR</key><string>$KB_DATA_DIR</string>
+    <key>PATH</key><string>$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>30</integer></dict>
+  <key>StandardOutPath</key><string>$KB_DATA_DIR/.librarian/nightly.out</string>
+  <key>StandardErrorPath</key><string>$KB_DATA_DIR/.librarian/nightly.err</string>
+</dict>
+</plist>
+EOF
+    launchctl unload "$PLIST" 2>/dev/null || true
+    launchctl load "$PLIST" 2>/dev/null && ok "nightly agent loaded ($PLIST_LABEL, 03:30)" \
+      || warn "wrote $PLIST but launchctl load failed — load it manually"
+  fi
+else
+  warn "not macOS — schedule scripts/librarian-nightly via cron yourself (e.g. 30 3 * * *)"
+fi
+echo
+
+# --- 7. search index ------------------------------------------------------
+echo "7. Search index…"
 if KB_DATA_DIR="$KB_DATA_DIR" "$KB_ENGINE_DIR/scripts/kb" index 2>/dev/null; then
   ok "FTS index built ($KB_DATA_DIR/.index/kb.db)"
 else

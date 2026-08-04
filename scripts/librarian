@@ -2,16 +2,20 @@
 # librarian — headless KB maintenance for Gregor's personal knowledge base.
 #
 # Usage:
-#   librarian file     --transcript <path> [--session-id <id>] [--hint <text>]
-#   librarian split    <kb-path>           [--session-id <id>]
-#   librarian collapse <kb-path>           [--session-id <id>]
-#   librarian dedup    <kb-path>           [--session-id <id>]
+#   librarian file         --transcript <path> [--session-id <id>] [--hint <text>]
+#   librarian split        <kb-path>           [--session-id <id>]
+#   librarian collapse     <kb-path>           [--session-id <id>]
+#   librarian dedup        <kb-path>           [--session-id <id>]
+#   librarian criticize    [model-id]          [--session-id <id>]
+#   librarian mine-recipes [kb-path]           [--session-id <id>]
 #
 # Modes implemented:
-#   file     — file a conversation transcript into the KB (slice 2)
-#   split    — split a leaf folder into topic-coherent subfolders (slice 3a)
-#   collapse — merge sparse subfolders back into their parent (slice 3b)
-#   dedup    — flag superseded entries and contradictions (slice 3b)
+#   file         — file a conversation transcript into the KB (slice 2)
+#   split        — split a leaf folder into topic-coherent subfolders (slice 3a)
+#   collapse     — merge sparse subfolders back into their parent (slice 3b)
+#   dedup        — flag superseded entries and contradictions (slice 3b)
+#   criticize    — attack the live theory layer; write ready experiments to the ledger
+#   mine-recipes — mine recurring procedures, propose draft recipes
 # Planned:
 #   link-fix, stale, compact (later slices)
 #
@@ -41,7 +45,7 @@ HINT=""
 FOLDER=""
 
 usage() {
-  sed -n '2,15p' "$0" >&2
+  sed -n '2,20p' "$0" >&2
   exit 2
 }
 
@@ -49,7 +53,7 @@ usage() {
 
 MODE="$1"; shift
 case "$MODE" in
-  file|split|collapse|dedup) ;;
+  file|split|collapse|dedup|criticize|mine-recipes) ;;
   link-fix|stale|compact)
     echo "mode '$MODE' not implemented yet" >&2
     exit 2
@@ -58,8 +62,9 @@ case "$MODE" in
   *) echo "unknown mode: $MODE" >&2; usage ;;
 esac
 
-# split / collapse / dedup take a positional kb:/ path. Pull it off if present.
-if [[ "$MODE" =~ ^(split|collapse|dedup)$ ]] && [ $# -gt 0 ] && [[ "$1" != --* ]]; then
+# split / collapse / dedup / mine-recipes take a positional kb:/ path;
+# criticize takes an optional positional model id. Pull it off if present.
+if [[ "$MODE" =~ ^(split|collapse|dedup|mine-recipes|criticize)$ ]] && [ $# -gt 0 ] && [[ "$1" != --* ]]; then
   FOLDER="$1"; shift
 fi
 
@@ -81,7 +86,9 @@ if [[ "$MODE" =~ ^(split|collapse|dedup)$ ]] && [ -z "$FOLDER" ]; then
   echo "$MODE requires a kb:/ folder path (positional or --folder)" >&2
   exit 2
 fi
-if [ -n "$FOLDER" ] && [[ "$FOLDER" != kb:/* ]]; then
+# mine-recipes defaults to the whole tree; criticize's positional is a model id, not a path
+[ "$MODE" = "mine-recipes" ] && [ -z "$FOLDER" ] && FOLDER="kb:/"
+if [ -n "$FOLDER" ] && [ "$MODE" != "criticize" ] && [[ "$FOLDER" != kb:/* ]]; then
   echo "folder must be a kb:/ URI, got: $FOLDER" >&2
   exit 2
 fi
@@ -235,6 +242,39 @@ Follow the procedure exactly:
 
 Conservative bias: if not confident two entries cover the same ground, leave them alone.
 If no high-confidence pairs, output SKIPPED. If LLM confidence is low on ≥30% of proposed pairs, output ABORTED.
+EOF
+    ;;
+  criticize)
+    cat > "$PROMPT_FILE" <<EOF
+Read $MECHANICS/librarian/procedure-criticize.md and follow it.
+
+Scope: ${FOLDER:-the whole live theory layer under kb:/models/}
+(if the scope above is a model id, criticize that model; otherwise criticize
+every live model)
+
+This is an automated weekly background run. Follow the procedure exactly,
+including the apply phase: upgrade matching problem stubs in kb:/problems/ to
+status: ready with complete pre-registered experiment blocks. Honor every
+constraint — especially: never flip a status to refuted or corroborated, never
+run an experiment, never git commit.
+
+If the live theory layer is empty, output SKIPPED: no live models.
+End with the CRITICISM report block from the procedure.
+EOF
+    ;;
+  mine-recipes)
+    cat > "$PROMPT_FILE" <<EOF
+Read $MECHANICS/librarian/procedure-mine-recipes.md and follow it.
+
+Scope: $FOLDER (recursive)
+
+Resolve $FOLDER to its on-disk path: kb:/foo → $KB_DATA_DIR/foo.
+If $FOLDER is exactly "kb:/", scope is the whole tree.
+
+This is an automated monthly background run — be conservative: propose draft
+recipes only for procedures with clear recurrence (>=2 independent episodes).
+If nothing recurs, output SKIPPED: <reason>.
+End with the DONE summary from the procedure. Do NOT git commit.
 EOF
     ;;
 esac
