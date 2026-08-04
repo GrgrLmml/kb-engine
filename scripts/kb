@@ -581,6 +581,20 @@ def cmd_eval(args) -> int:
     scored = [c for c in cases if c.get("expect")]
     if not scored:
         sys.exit("kb eval: gold set has no cases with expectations")
+    if args.recall:
+        # auto-recall calibration: fire on KB-relevant prompts, stay silent on
+        # the no-hit set. This is the registration gate for the recall hook.
+        nohit = [c for c in cases if not c.get("expect")]
+        hit = sum(1 for c in scored
+                  if any(r["id"] in c["expect"]
+                         for r in recall_candidates(root, con, str(c["q"]))))
+        fires = sum(1 for c in nohit
+                    if recall_candidates(root, con, str(c["q"])))
+        print(f"kb eval --recall: hit-rate {hit}/{len(scored)} "
+              f"({hit / len(scored):.2f}) · false-fires {fires}/{len(nohit)} "
+              f"on the no-hit set (thresholds: cos>={RECALL_COS_MIN}, "
+              f"bm25>={RECALL_BM25_MIN})")
+        return 1 if fires else 0
     has_vecs = con.execute("SELECT 1 FROM vectors LIMIT 1").fetchone()
     modes = [args.mode] if args.mode != "all" else (
         ["lexical", "vector", "hybrid"] if has_vecs else ["lexical"])
@@ -696,6 +710,36 @@ def cmd_edges(args) -> int:
 
 # -------------------------------------------------------------------- routes
 
+def recipe_trigger_lines(root: Path) -> list[str]:
+    """One `when_to_use` line per recipe — what /start and ambient match on."""
+    out: list[str] = []
+    rec_dir = root / "recipes"
+    if rec_dir.is_dir():
+        for p in sorted(rec_dir.glob("*.md")):
+            if p.name == "_route.md":
+                continue
+            fm, _ = parse_fm(p)
+            if fm and fm.get("type") == "recipe":
+                tag = "" if fm.get("status") == "active" else f" [{fm.get('status')}]"
+                out.append(f"  {fm.get('id')}{tag}: {first_line(fm.get('when_to_use'), 150)}")
+    return out
+
+
+def model_statement_lines(root: Path) -> list[str]:
+    """One statement line per live model — the ambient premises for deduction."""
+    out: list[str] = []
+    mdl_dir = root / "models"
+    if mdl_dir.is_dir():
+        for p in sorted(mdl_dir.glob("*.md")):
+            if p.name == "_route.md":
+                continue
+            fm, _ = parse_fm(p)
+            if fm and fm.get("type") == "model" and fm.get("status") != "superseded":
+                tag = f" [{fm.get('status')}]"
+                out.append(f"  {fm.get('id')}{tag}: {first_line(fm.get('statement'), 150)}")
+    return out
+
+
 def cmd_routes(args) -> int:
     root = kb_root()
     routes = [p for p in walk_md(root) if p.name == "_route.md"]
@@ -717,31 +761,16 @@ def cmd_routes(args) -> int:
                 out.append(f"  {ent.get('id')} — {first_line(ent.get('summary'), 120)}")
             out.append("")
         # recipes get their trigger line too — that's what /start matches on
-        rec_dir = root / "recipes"
-        if rec_dir.is_dir():
+        rec = recipe_trigger_lines(root)
+        if rec:
             out.append("recipe triggers (when_to_use):")
-            for p in sorted(rec_dir.glob("*.md")):
-                if p.name == "_route.md":
-                    continue
-                fm, _ = parse_fm(p)
-                if fm and fm.get("type") == "recipe":
-                    tag = "" if fm.get("status") == "active" else f" [{fm.get('status')}]"
-                    out.append(f"  {fm.get('id')}{tag}: {first_line(fm.get('when_to_use'), 150)}")
+            out.extend(rec)
         # models get their statement line — the ambient premises for deduction
-        mdl_dir = root / "models"
-        if mdl_dir.is_dir():
-            stmts = []
-            for p in sorted(mdl_dir.glob("*.md")):
-                if p.name == "_route.md":
-                    continue
-                fm, _ = parse_fm(p)
-                if fm and fm.get("type") == "model" and fm.get("status") != "superseded":
-                    tag = f" [{fm.get('status')}]"
-                    stmts.append(f"  {fm.get('id')}{tag}: {first_line(fm.get('statement'), 150)}")
-            if stmts:
-                out.append("")
-                out.append("model statements (deductive premises — combine to derive; cite ids):")
-                out.extend(stmts)
+        stmts = model_statement_lines(root)
+        if stmts:
+            out.append("")
+            out.append("model statements (deductive premises — combine to derive; cite ids):")
+            out.extend(stmts)
         text = "\n".join(out)
         print(text)
         chars = len(text)
@@ -1230,6 +1259,35 @@ filed episode as evidence.
 """)
 
 
+def problems_brief_text(root: Path, probs=None) -> str:
+    """The compact ambient block; empty string when no live problems."""
+    if probs is None:
+        probs = load_problems(root)
+    live = [(p, fm) for p, fm, _ in probs if fm.get("status") in ("open", "ready")]
+    if not live:
+        return ""
+    ready = [(p, fm) for p, fm in live if fm.get("status") == "ready"]
+    oldest = max(age_days(fm.get("created")) for _, fm in live)
+    resolved_30d = sum(1 for _, fm, _ in probs
+                       if fm.get("status") == "resolved"
+                       and 0 <= age_days(fm.get("updated")) <= 30)
+    out = [f"OPEN PROBLEMS (theory layer): {len(live) - len(ready)} open · "
+           f"{len(ready)} ready to run · oldest {oldest}d · "
+           f"{resolved_30d} resolved in last 30d"]
+    for _, fm in sorted(ready, key=lambda x: age_days(x[1].get("created")),
+                        reverse=True):
+        exp = fm.get("experiment") or {}
+        out.append(f"  READY {fm.get('id')} ({age_days(fm.get('created'))}d, "
+                   f"{exp.get('decisiveness', '?')}/{first_line(exp.get('cost'), 40)}): "
+                   f"{first_line(exp.get('observation'), 140)}")
+    if ready:
+        out.append("  Run one now: /run-experiment <id>")
+    else:
+        out.append("  No experiments designed yet — /criticize turns open problems "
+                   "into ready ones.")
+    return "\n".join(out)
+
+
 def cmd_problems(args) -> int:
     root = kb_root()
     con = ensure_index(root)
@@ -1317,28 +1375,9 @@ def cmd_problems(args) -> int:
         return 0
 
     if action == "brief":
-        live = [(p, fm) for p, fm, _ in probs if fm.get("status") in ("open", "ready")]
-        if not live:
-            return 0
-        ready = [(p, fm) for p, fm in live if fm.get("status") == "ready"]
-        oldest = max(age_days(fm.get("created")) for _, fm in live)
-        resolved_30d = sum(1 for _, fm, _ in probs
-                           if fm.get("status") == "resolved"
-                           and 0 <= age_days(fm.get("updated")) <= 30)
-        print(f"OPEN PROBLEMS (theory layer): {len(live) - len(ready)} open · "
-              f"{len(ready)} ready to run · oldest {oldest}d · "
-              f"{resolved_30d} resolved in last 30d")
-        for _, fm in sorted(ready, key=lambda x: age_days(x[1].get("created")),
-                            reverse=True):
-            exp = fm.get("experiment") or {}
-            print(f"  READY {fm.get('id')} ({age_days(fm.get('created'))}d, "
-                  f"{exp.get('decisiveness', '?')}/{first_line(exp.get('cost'), 40)}): "
-                  f"{first_line(exp.get('observation'), 140)}")
-        if ready:
-            print(f"  Run one now: /run-experiment <id>")
-        else:
-            print("  No experiments designed yet — /criticize turns open problems "
-                  "into ready ones.")
+        text = problems_brief_text(root, probs)
+        if text:
+            print(text)
         return 0
 
     if action in ("resolve", "drop"):
@@ -1363,6 +1402,217 @@ def cmd_problems(args) -> int:
         return 0
 
     sys.exit(f"kb problems: unknown action {action!r}")
+
+
+# ------------------------------------------------------------------- ambient
+#
+# The SessionStart payload, tiered so global cost is O(folders), not O(entries):
+#   Tier A (always): folder map + recipe triggers + model statements.
+#   Tier B (cwd-relevant): per-entry lines ONLY for folders matching the repo
+#     the session opened in (exact-token match — fails closed).
+#   Tier C (deltas): problems brief, fresh nightly digest, unfiled-session queue.
+# The full per-entry map stays one call away: `kb routes --compact`.
+
+def _cwd_tokens(cwd: str) -> set[str]:
+    toks = {Path(cwd).name.lower()}
+    try:
+        url = subprocess.run(["git", "-C", cwd, "remote", "get-url", "origin"],
+                             capture_output=True, text=True, timeout=3).stdout.strip()
+        if url:
+            toks.add(re.sub(r"\.git$", "", url.rstrip("/").split("/")[-1]).lower())
+    except Exception:
+        pass
+    # split compounds: acme-api -> {acme-api, acme, api}; drop short fragments
+    for t in list(toks):
+        toks.update(x for x in re.split(r"[-_.]", t) if len(x) >= 3)
+    return {t for t in toks if len(t) >= 3}
+
+
+def capture_queue_lines(root: Path, limit: int = 5) -> list[str]:
+    """Unfiled-session suggestions written by the SessionEnd capture hook."""
+    q = root / ".librarian" / "capture-queue.tsv"
+    if not q.is_file():
+        return []
+    rows = []
+    for line in q.read_text().splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 4 and 0 <= age_days(parts[0]) <= 14:
+            rows.append(parts)
+    rows = rows[-limit:][::-1]  # newest first
+    return [f"  [{i + 1}] {r[0][:10]} \"{r[3][:80]}\" — transcript: {r[2]}"
+            for i, r in enumerate(rows)]
+
+
+def cmd_ambient(args) -> int:
+    root = kb_root()
+    out: list[str] = []
+
+    routes = [(p, parse_fm(p)[0]) for p in walk_md(root) if p.name == "_route.md"]
+    out.append("FOLDER MAP (per-entry detail: `kb routes --compact`; ranked search: `kb search`):")
+    entry_map: dict[str, list[str]] = {}
+    route_meta: list[tuple[str, list[str], dict]] = []
+    for rp, fm in routes:
+        if fm is None:
+            continue
+        folder = fm.get("folder", to_kb_uri(root, rp.parent))
+        ents = [e for e in (fm.get("entries") or []) if isinstance(e, dict)]
+        out.append(f"  {folder} ({len(ents)}) — {first_line(fm.get('purpose'), 140)}")
+        entry_map[folder] = [f"    {e.get('id')} — {first_line(e.get('summary'), 110)}"
+                             for e in ents]
+        route_meta.append((folder, [str(t).lower() for t in (fm.get("topics") or [])], fm))
+
+    rec = recipe_trigger_lines(root)
+    if rec:
+        out += ["", "recipe triggers (when_to_use):", *rec]
+    stmts = model_statement_lines(root)
+    if stmts:
+        out += ["", "model statements (deductive premises — combine to derive; cite ids):", *stmts]
+
+    if args.cwd:
+        toks = _cwd_tokens(args.cwd)
+        # models/recipes/problems are already ambient via their Tier-A blocks
+        matched = [f for f, topics, _ in route_meta
+                   if f.split("/")[-1].lower() not in ("models", "recipes", "problems")
+                   and (f.split("/")[-1].lower() in toks or toks & set(topics))]
+        shown = [f for f in matched if entry_map.get(f)]
+        if shown:
+            out += ["", f"RELEVANT TO THIS REPO ({Path(args.cwd).name}) — full entry lists:"]
+            for f in shown:
+                out.append(f"  {f}:")
+                out += entry_map[f]
+
+    brief = problems_brief_text(root)
+    if brief:
+        out += ["", brief]
+
+    digest = root / ".librarian" / "digest.md"
+    if digest.is_file():
+        import time
+        if time.time() - digest.stat().st_mtime < 86400:
+            # summary bullets + deltas only; the problems brief above already
+            # covers the ledger, and standing findings live in `kb doctor`
+            lines = digest.read_text().splitlines()
+            cut = next((i for i, l in enumerate(lines)
+                        if l.startswith("OPEN PROBLEMS")), len(lines))
+            slim = [l for l in lines[:cut] if l.strip()][:25]
+            out += ["", "LIBRARIAN DIGEST (overnight run):", *slim]
+
+    unfiled = capture_queue_lines(root)
+    if unfiled:
+        out += ["", f"UNFILED SESSIONS ({len(unfiled)}) — say \"file #N\" to file one "
+                    f"in the background (scripts/librarian file --transcript <path>):",
+                *unfiled]
+
+    text = "\n".join(out)
+    print(text)
+    print(f"\nBASELINE: level=ambient routes={len(routes)} chars={len(text)} "
+          f"est_tokens={len(text) // 4}")
+    return 0
+
+
+# -------------------------------------------------------------------- recall
+#
+# Semantic auto-recall: score a raw conversational prompt against the KB and
+# return at most n relevant leaves, or nothing. Cosine over HEAD vectors only
+# (chunked transcript bodies are exactly the noise source for conversational
+# text), unioned with a stopword-filtered BM25 leg. Session-scoped dedupe so
+# the same entry is never injected twice into one session.
+
+RECALL_STOP = frozenset("""
+the and for with that this from have has was were are you your our their they
+them then than what when where which while who whom whose why how can could
+should would will just like also into over under about after before between
+during against without within being been because but not all any some more
+most other such only own same so too very s t don now let know need want make
+made using use used get got run running new old good great think really
+something anything nothing help please thanks maybe actually probably
+question answer look looking file files code change changes fix issue
+""".split())
+
+# Calibrated against the _eval.yaml no-hit set (kb eval --recall): irrelevant
+# conversational prompts top out around cos 0.31 on this corpus, so 0.40 fires
+# only on real matches; a bm25-only hit needs to be either very strong (exact
+# terminology) or corroborated by a near-threshold cosine.
+RECALL_COS_MIN = 0.40
+RECALL_COS_WEAK = 0.35
+RECALL_BM25_MIN = 8.0
+RECALL_BM25_STRONG = 14.0
+
+
+def recall_candidates(root: Path, con, text: str, n: int = 3) -> list[dict]:
+    text = re.sub(r"```.*?```", " ", text, flags=re.S)  # code blocks are noise
+    live_leaf = ("AND m.doctype IN ('entry','recipe','model','problem') "
+                 "AND (m.status IN ('active','draft','hypothesis','corroborated',"
+                 "'open','ready') OR m.status IS NULL)")
+    cos: dict[str, float] = {}
+    q = _embed(root, [text])
+    if q is not None:
+        rows = con.execute(
+            f"SELECT v.path, v.vec FROM vectors v JOIN meta m ON m.path = v.path "
+            f"WHERE v.kind = 'head' {live_leaf}").fetchall()
+        if rows:
+            import numpy as np
+            mat = np.frombuffer(b"".join(r[1] for r in rows),
+                                dtype=np.float32).reshape(len(rows), -1)
+            cos = {path: float(s) for (path, _), s in zip(rows, mat @ q[0])}
+    bm: dict[str, float] = {}
+    toks = [t for t in re.findall(r"[A-Za-z0-9_-]{3,}", text.lower())
+            if t not in RECALL_STOP][:24]
+    if len(toks) >= 2:
+        sql = (f"SELECT m.path, bm25(docs, {BM25_WEIGHTS}) AS score "
+               f"FROM docs JOIN meta m ON m.path = docs.path "
+               f"WHERE docs MATCH ? {live_leaf} ORDER BY score LIMIT 10")
+        bm = {path: -score for path, score
+              in con.execute(sql, (fts_query(" ".join(toks)),))}
+    hits: dict[str, dict] = {}
+    for path in set(cos) | set(bm):
+        c, b = cos.get(path, 0.0), bm.get(path, 0.0)
+        if (c >= RECALL_COS_MIN
+                or b >= RECALL_BM25_STRONG
+                or (b >= RECALL_BM25_MIN and c >= RECALL_COS_WEAK)):
+            hits[path] = {"cos": c or None, "bm25": b or None}
+    ranked = sorted(hits.items(),
+                    key=lambda x: (-(x[1]["cos"] or 0), -(x[1]["bm25"] or 0)))[:n]
+    out = []
+    for path, comp in ranked:
+        row = con.execute(
+            "SELECT m.id, m.doctype, m.title, "
+            "(SELECT summary FROM docs WHERE docs.path = m.path) "
+            "FROM meta m WHERE m.path = ?", (path,)).fetchone()
+        if row:
+            out.append({"id": row[0], "type": row[1], "title": row[2],
+                        "summary": first_line(row[3]), "path": str(from_kb_uri(root, path)),
+                        **comp})
+    return out
+
+
+def cmd_recall(args) -> int:
+    root = kb_root()
+    con = ensure_index(root)
+    text = sys.stdin.read()
+    if len(text.strip()) < 20:
+        return 0
+    cands = recall_candidates(root, con, text, args.n)
+    if args.session_id and cands:
+        state_dir = root / ".index" / "recall-state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        state = state_dir / f"{args.session_id}.json"
+        seen = set(json.loads(state.read_text())) if state.is_file() else set()
+        cands = [c for c in cands if c["id"] not in seen]
+        if cands:
+            state.write_text(json.dumps(sorted(seen | {c["id"] for c in cands})))
+    if not cands:
+        return 0
+    if args.json:
+        print(json.dumps(cands, indent=2, ensure_ascii=False))
+        return 0
+    for c in cands:
+        why = (f"cos={c['cos']:.2f}" if c["cos"] else "") + \
+              (f" bm25={c['bm25']:.1f}" if c["bm25"] else "")
+        print(f"{c['id']} ({c['type']}, {why.strip()}) — {c['title']}")
+        print(f"  {c['summary']}")
+        print(f"  file: {c['path']}")
+    return 0
 
 
 # ---------------------------------------------------------------------- main
@@ -1395,7 +1645,19 @@ def main() -> int:
     p.add_argument("--mode", choices=["all", "hybrid", "lexical", "vector"], default="all")
     p.add_argument("--save-baseline", action="store_true",
                    help="store current MRR per mode as the regression baseline")
+    p.add_argument("--recall", action="store_true",
+                   help="calibrate auto-recall: hit-rate on gold + false-fires on the no-hit set")
     p.set_defaults(fn=cmd_eval)
+
+    p = sub.add_parser("ambient", help="tiered SessionStart payload (folder map + cwd-relevant entries + deltas)")
+    p.add_argument("--cwd", help="session working directory (enables Tier B relevance)")
+    p.set_defaults(fn=cmd_ambient)
+
+    p = sub.add_parser("recall", help="score a prompt (stdin) against the KB; print at most n relevant leaves")
+    p.add_argument("-n", type=int, default=3)
+    p.add_argument("--session-id", help="dedupe state key — never re-inject the same entry in one session")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_recall)
 
     p = sub.add_parser("show", help="resolve an id / kb:/ URI / path and print it")
     p.add_argument("ref")

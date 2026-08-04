@@ -28,6 +28,8 @@ AGENT_DIR="$CLAUDE_DIR/agents"
 HOOK="$KB_ENGINE_DIR/hooks/normalize-topics.sh"
 START_HOOK="$KB_ENGINE_DIR/hooks/session-start.sh"
 ALLOW_HOOK="$KB_ENGINE_DIR/hooks/allow-kb-query.sh"
+RECALL_HOOK="$KB_ENGINE_DIR/hooks/auto-recall.sh"
+CAPTURE_HOOK="$KB_ENGINE_DIR/hooks/capture-candidate.sh"
 
 KB_DATA_DIR="$KB_ENGINE_DIR/kb-data"
 ASSUME_YES=0
@@ -74,7 +76,7 @@ if [ "$UNINSTALL" = 1 ]; then
     done
   fi
   if [ -f "$SETTINGS" ] && [ -n "$PY" ]; then
-    "$PY" - "$SETTINGS" "$KB_ENGINE_DIR" "$KB_DATA_DIR" "$HOOK" "$START_HOOK" "$ALLOW_HOOK" <<'PYEOF'
+    "$PY" - "$SETTINGS" "$KB_ENGINE_DIR" "$KB_DATA_DIR" "$HOOK" "$START_HOOK" "$ALLOW_HOOK" "$RECALL_HOOK" "$CAPTURE_HOOK" <<'PYEOF'
 import json, sys
 p, mech, data, *ours = sys.argv[1:]
 d = json.load(open(p))
@@ -226,9 +228,9 @@ if [ -z "$PY" ]; then warn "python3 unavailable — skipping settings edit; set 
   fi
   if [ "$do_it" = 1 ]; then
     mkdir -p "$CLAUDE_DIR"; [ -f "$SETTINGS" ] || echo '{}' > "$SETTINGS"
-    "$PY" - "$SETTINGS" "$KB_ENGINE_DIR" "$KB_DATA_DIR" "$HOOK" "$START_HOOK" "$ALLOW_HOOK" <<'PYEOF'
+    "$PY" - "$SETTINGS" "$KB_ENGINE_DIR" "$KB_DATA_DIR" "$HOOK" "$START_HOOK" "$ALLOW_HOOK" "$RECALL_HOOK" "$CAPTURE_HOOK" <<'PYEOF'
 import json, sys
-p, mech, data, hook, start_hook, allow_hook = sys.argv[1:7]
+p, mech, data, hook, start_hook, allow_hook, recall_hook, capture_hook = sys.argv[1:9]
 d = json.load(open(p))
 d.setdefault("env", {})["KB_ENGINE_DIR"] = mech
 d["env"]["KB_DATA_DIR"] = data
@@ -253,6 +255,16 @@ if not any(h.get("command") == allow_hook for g in pt for h in g.get("hooks", []
     # containing $KB_ENGINE_DIR (the expansion heuristic forces a prompt)
     pt.append({"matcher": "Bash",
                "hooks": [{"type": "command", "command": allow_hook, "timeout": 10}]})
+ups = hooks.setdefault("UserPromptSubmit", [])
+if not any(h.get("command") == recall_hook for g in ups for h in g.get("hooks", [])):
+    # semantic auto-recall — registration gated on `kb eval --recall` showing
+    # zero false-fires on the no-hit calibration set
+    ups.append({"hooks": [{"type": "command", "command": recall_hook, "timeout": 15}]})
+se2 = hooks.setdefault("SessionEnd", [])
+if not any(h.get("command") == capture_hook for g in se2 for h in g.get("hooks", [])):
+    # capture-candidate queue (deterministic, no LLM) — feeds UNFILED SESSIONS
+    se2.append({"hooks": [{"type": "command", "command": capture_hook,
+                           "async": True, "timeout": 15}]})
 perms = d.setdefault("permissions", {})
 allow = perms.setdefault("allow", [])
 for rule in (

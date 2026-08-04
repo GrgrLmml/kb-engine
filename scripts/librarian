@@ -302,5 +302,11 @@ if [ $EXIT_CODE -ne 0 ]; then
   log "## ERROR: claude -p exited non-zero"
 fi
 
+# Dequeue: a filed (or skipped) transcript leaves the capture-candidate queue.
+QUEUE="$KB_ROOT/.librarian/capture-queue.tsv"
+if [ "$MODE" = "file" ] && [ $EXIT_CODE -eq 0 ] && [ -n "$TRANSCRIPT" ] && [ -f "$QUEUE" ]; then
+  grep -vF "$TRANSCRIPT" "$QUEUE" > "$QUEUE.tmp" 2>/dev/null && mv "$QUEUE.tmp" "$QUEUE" || rm -f "$QUEUE.tmp"
+fi
+
 # trap handles lock + tmpfile cleanup
 exit $EXIT_CODE

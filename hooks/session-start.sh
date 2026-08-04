@@ -1,10 +1,11 @@
 #!/bin/bash
 # session-start.sh — Claude Code SessionStart hook for Gregor's KB.
 #
-# Injects the COMPACT KB index (folder purposes + one line per entry + recipe
-# triggers, a few thousand tokens) into every new session as additionalContext.
-# This makes the KB ambient: the model starts out knowing what exists and can
-# /find, /promote, or kb-search on its own initiative instead of flying blind.
+# Injects the tiered ambient payload (`kb ambient`) into every new session:
+#   Tier A (always, ~2-3k tokens): folder map + recipe triggers + model statements
+#   Tier B (cwd-relevant): full entry lists for KB folders matching this repo
+#   Tier C (deltas): problems brief, fresh nightly digest, unfiled-session queue
+# The per-entry map for everything else stays one call away (kb routes --compact).
 #
 # Registered by install.sh with matcher "startup|clear" so resumed sessions
 # don't get a duplicate copy.
@@ -19,42 +20,28 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${KB_ENGINE_DIR:=$(dirname "$SCRIPT_DIR")}"
 : "${KB_DATA_DIR:=$KB_ENGINE_DIR/kb-data}"
 
-# Drain stdin (the hook JSON payload); we don't need it.
-while IFS= read -t 2 -r _line; do :; done 2>/dev/null || true
+# Read the hook payload; the session cwd drives Tier B relevance.
+PAYLOAD=""
+while IFS= read -t 2 -r _line; do PAYLOAD+="$_line"; done 2>/dev/null || true
 
 [ -f "$KB_DATA_DIR/.no-ambient" ] && exit 0
 [ -x "$KB_ENGINE_DIR/scripts/kb" ] || exit 0
 command -v uv >/dev/null 2>&1 || exit 0
 
-INDEX="$(KB_DATA_DIR="$KB_DATA_DIR" "$KB_ENGINE_DIR/scripts/kb" routes --compact 2>/dev/null)" || exit 0
+CWD="$(printf '%s' "$PAYLOAD" | /usr/bin/jq -r '.cwd // empty' 2>/dev/null || true)"
+
+if [ -n "$CWD" ]; then
+  INDEX="$(KB_DATA_DIR="$KB_DATA_DIR" "$KB_ENGINE_DIR/scripts/kb" ambient --cwd "$CWD" 2>/dev/null)" || exit 0
+else
+  INDEX="$(KB_DATA_DIR="$KB_DATA_DIR" "$KB_ENGINE_DIR/scripts/kb" ambient 2>/dev/null)" || exit 0
+fi
 [ -n "$INDEX" ] || exit 0
-
-# Epistemic problem ledger: durable open conflicts under kb:/problems/, with
-# lifecycle counts and any ready-to-run experiments. Deterministic and cheap —
-# surfacing it ambiently lets the session suggest /criticize (design experiments)
-# or /run-experiment (resolve one) when warranted. Empty output when no live problems.
-PROBLEMS="$(KB_DATA_DIR="$KB_DATA_DIR" "$KB_ENGINE_DIR/scripts/kb" problems brief 2>/dev/null)" || PROBLEMS=""
-if [ -n "$PROBLEMS" ]; then
-  INDEX="$INDEX
-
-$PROBLEMS"
-fi
-
-# Nightly librarian digest: inject while fresh (<24h) so overnight results reach
-# the owner without a new surface to check. Written by scripts/librarian-nightly.
-DIGEST="$KB_DATA_DIR/.librarian/digest.md"
-if [ -f "$DIGEST" ] && [ -n "$(find "$DIGEST" -mtime -1 2>/dev/null)" ]; then
-  INDEX="$INDEX
-
-LIBRARIAN DIGEST (overnight run):
-$(cat "$DIGEST")"
-fi
 
 # Hard cap so a runaway corpus can never flood the context (~15k tokens).
 MAXCHARS=60000
 if [ "${#INDEX}" -gt "$MAXCHARS" ]; then
   INDEX="${INDEX:0:$MAXCHARS}
-[... index truncated at ${MAXCHARS} chars — corpus has outgrown ambient injection; see docs/plan-day2.md Phase 4 ...]"
+[... ambient payload truncated at ${MAXCHARS} chars — something is wrong; check kb ambient ...]"
 fi
 
 export INDEX KB_ENGINE_DIR
@@ -64,13 +51,14 @@ import json, os
 index = os.environ["INDEX"]
 engine = os.environ["KB_ENGINE_DIR"]
 context = f"""<kb-ambient-index>
-This is the compact index of Gregor's personal knowledge base (auto-injected at session start).
-One line per entry: `id — one-line summary`, grouped by folder; recipe triggers at the end.
+This is the ambient map of Gregor's personal knowledge base (auto-injected at session start).
+It is the FOLDER-level map plus recipe triggers and model statements — NOT the full entry list.
 Use it to notice when prior context exists. To act on it:
-- `{engine}/scripts/kb search <terms>` — ranked full-text search (or the /find command)
+- `{engine}/scripts/kb search <terms>` — hybrid ranked search (or the /find command)
+- `{engine}/scripts/kb routes --compact` — the full one-line-per-entry map
 - `{engine}/scripts/kb show <id>` — print a full entry (or /promote <id>)
 - for questions answered INSIDE transcripts (exact commands, "how did we…", multi-entry overviews): delegate to the `kb-researcher` subagent (or /ask) instead of reading transcripts here
-Do not treat this index as complete detail — it is the WARM-tier map, not the content.
+- an OPEN PROBLEMS block below means the theory layer has unresolved conflicts: /criticize designs experiments, /run-experiment resolves them
 
 {index}
 </kb-ambient-index>"""
