@@ -6,6 +6,16 @@ kill switch; routes partially derived; auto-recall built but not registered; CLI
 not MCP; jot = normal entry with minimal body). Phase 4 remains trigger-gated;
 scheduled tidy and link-fix remain open.*
 
+*Update 2026-08-04: the Phase-4 trigger fired (deep corpus 150,655 est. tokens) and
+Phase 4 SHIPPED — with one deviation from the sketch below: no `sqlite-vec`. At
+this scale (~1.2k vectors) brute-force numpy over a `vectors` table in the same
+kb.db is microseconds, with none of the loadable-extension fragility. Embeddings
+are model2vec static vectors (`potion-retrieval-32M`, numpy-only, ~ms/query),
+head + body-chunk per doc, RRF-fused with BM25. Gated by the new `kb eval` gold
+set (`_eval.yaml`): hybrid MRR@10 0.644 vs lexical 0.633, recall@5 0.88 vs 0.81.
+Scheduled maintenance also SHIPPED (scripts/librarian-nightly via launchd), and
+the theory layer gained the durable problem ledger (`kb problems`, /run-experiment).*
+
 ## Where we are
 
 The PoC works: filing, routes, typed edges, recipes, validation, topic normalization.

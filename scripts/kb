@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --quiet --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["pyyaml>=6"]
+# dependencies = ["pyyaml>=6", "numpy>=1.26", "model2vec>=0.4"]
 # ///
 """kb — deterministic primitives for Gregor's knowledge base.
 
@@ -10,8 +10,9 @@ bookkeeping by hand. Everything mechanical lives here; judgment stays with the
 model.
 
 Subcommands:
-  index            build/refresh the SQLite FTS5 search index (incremental, by mtime)
-  search QUERY     BM25-ranked full-text search over frontmatter + body
+  index            build/refresh the search index: FTS5 + local embeddings (incremental, by mtime)
+  search QUERY     hybrid-ranked (BM25 ∪ vector, RRF) search over frontmatter + body
+  eval             retrieval-quality metrics (MRR/recall) over the _eval.yaml gold set
   show ID|URI|PATH resolve an entry and print it (--path: print the path only)
   edges ID         resolved typed edges, forward AND reverse ("what links here")
   routes           emit the route layer (+ BASELINE metrics); --compact / --deep
@@ -116,6 +117,15 @@ def walk_md(root: Path):
             yield p
 
 
+def walk_txt(root: Path):
+    """Sidecar .txt artifacts (interview feedback, question sheets, …) — indexed
+    as doctype 'attachment' so their content is searchable, but excluded from
+    routes, doctor, and the ambient index. `_`-prefixed files are config."""
+    for p in sorted(root.rglob("*.txt")):
+        if not _hidden(root, p) and not p.name.startswith("_"):
+            yield p
+
+
 def first_line(s: object, limit: int = 200) -> str:
     """First paragraph, collapsed to one line, truncated."""
     if not isinstance(s, str) or not s.strip():
@@ -127,12 +137,16 @@ def first_line(s: object, limit: int = 200) -> str:
 
 # --------------------------------------------------------------------- index
 
+# Bump SCHEMA_VERSION whenever the FTS shape or tokenizer changes: the index is
+# documented-disposable, so a mismatch just drops and rebuilds it transparently.
+SCHEMA_VERSION = "2"  # 2: porter stemming, attachments, vectors table
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
   path TEXT PRIMARY KEY,        -- kb:/ URI
   mtime REAL NOT NULL,
   id TEXT,
-  doctype TEXT NOT NULL,        -- entry | recipe | model | problem | route
+  doctype TEXT NOT NULL,        -- entry | recipe | model | problem | route | attachment
   status TEXT,
   title TEXT,
   created TEXT,
@@ -142,7 +156,7 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(
   id, title, topics, participants, summary, extra, body, path UNINDEXED,
-  tokenize = 'unicode61'
+  tokenize = 'porter unicode61'
 );
 CREATE TABLE IF NOT EXISTS edges (
   src TEXT NOT NULL,            -- source id
@@ -150,12 +164,30 @@ CREATE TABLE IF NOT EXISTS edges (
   target TEXT NOT NULL,         -- bare id, or kb:/ URI for related
   PRIMARY KEY (src, kind, target)
 );
+CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target);
+CREATE TABLE IF NOT EXISTS vectors (
+  path TEXT NOT NULL,           -- kb:/ URI
+  kind TEXT NOT NULL,           -- 'head' | 'chunk:N'
+  dim INTEGER NOT NULL,
+  vec BLOB NOT NULL,            -- float32, L2-normalized at write time
+  PRIMARY KEY (path, kind)
+);
+CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
 """
 
 
 def open_db(root: Path) -> sqlite3.Connection:
     con = sqlite3.connect(db_path(root))
+    con.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)")
+    row = con.execute("SELECT v FROM kv WHERE k = 'schema_version'").fetchone()
+    if row is None or row[0] != SCHEMA_VERSION:
+        # disposable by contract — drop and let the caller repopulate
+        for t in ("docs", "meta", "edges", "vectors"):
+            con.execute(f"DROP TABLE IF EXISTS {t}")
+        con.execute("INSERT OR REPLACE INTO kv VALUES ('schema_version', ?)",
+                    (SCHEMA_VERSION,))
     con.executescript(SCHEMA)
+    con.commit()
     return con
 
 
@@ -211,16 +243,89 @@ def index_edges(con: sqlite3.Connection, fm: dict) -> None:
         con.execute("INSERT OR IGNORE INTO edges VALUES (?,?,?)", (src, "superseded_by", sb))
 
 
+# ---------------------------------------------------------------- embeddings
+#
+# Local static embeddings (model2vec): tokenize -> table lookup -> mean-pool.
+# No torch, no ONNX runtime, ~ms per text — cheap enough to ride the incremental
+# index path. Vector search is one leg of RRF fusion; BM25 is the other; the
+# LLM re-ranks in-session. Model is cached under .index/model/ after the first
+# (network) download; everything degrades gracefully to lexical-only without it.
+# Kill switch: KB_NO_EMBED=1.
+
+EMBED_MODEL = "minishlab/potion-retrieval-32M"
+
+
+def _encoder(root: Path):
+    """Lazy-load the embedding model once per process; None if unavailable."""
+    if hasattr(_encoder, "_m"):
+        return _encoder._m
+    m = None
+    if not os.environ.get("KB_NO_EMBED"):
+        try:
+            from model2vec import StaticModel
+            cache = root / ".index" / "model" / EMBED_MODEL.split("/")[-1]
+            if cache.is_dir():
+                m = StaticModel.from_pretrained(str(cache))
+            else:
+                m = StaticModel.from_pretrained(EMBED_MODEL)  # downloads once
+                cache.mkdir(parents=True, exist_ok=True)
+                m.save_pretrained(str(cache))
+        except Exception as e:
+            print(f"kb: embeddings unavailable ({type(e).__name__}) — lexical only",
+                  file=sys.stderr)
+            m = None
+    _encoder._m = m
+    return m
+
+
+def _embed(root: Path, texts: list[str]):
+    """L2-normalized float32 matrix, or None when no encoder is available."""
+    m = _encoder(root)
+    if m is None:
+        return None
+    import numpy as np
+    v = np.asarray(m.encode(texts), dtype=np.float32)
+    if v.ndim == 1:
+        v = v.reshape(1, -1)
+    norms = np.linalg.norm(v, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return v / norms
+
+
+def _chunks(body: str, size: int = 1200, overlap: int = 150) -> list[str]:
+    """Greedy paragraph packing; short bodies ride the head vector alone."""
+    if len(body) <= 1800:
+        return []
+    chunks: list[str] = []
+    cur = ""
+    for para in body.split("\n\n"):
+        if cur and len(cur) + len(para) > size:
+            chunks.append(cur)
+            cur = cur[-overlap:] + "\n\n" + para
+        else:
+            cur = f"{cur}\n\n{para}" if cur else para
+    if cur.strip():
+        chunks.append(cur)
+    return chunks
+
+
 def cmd_index(args) -> int:
     root = kb_root()
     con = open_db(root)
+    # embedding-model change invalidates every vector: wipe and force re-read
+    row = con.execute("SELECT v FROM kv WHERE k = 'embed_model'").fetchone()
+    if row and row[0] != EMBED_MODEL:
+        con.execute("DELETE FROM vectors")
+        con.execute("UPDATE meta SET mtime = 0")
     known = {p: m for p, m in con.execute("SELECT path, mtime FROM meta")}
     if args.rebuild:
         con.execute("DELETE FROM meta")
         con.execute("DELETE FROM docs")
         con.execute("DELETE FROM edges")
+        con.execute("DELETE FROM vectors")
         known = {}
     seen, added, refreshed = set(), 0, 0
+    pending: list[tuple[str, str, list[str]]] = []  # (uri, head text, body chunks)
     for path in walk_md(root):
         uri = to_kb_uri(root, path)
         seen.add(uri)
@@ -247,12 +352,55 @@ def cmd_index(args) -> int:
              d["title"], fm.get("created"), fm.get("updated"),
              d["topics"], d["participants"]))
         index_edges(con, fm)
+        if doctype != "route":
+            head = " | ".join(x for x in (d["title"], d["topics"],
+                                          d["summary"], d["extra"]) if x)
+            pending.append((uri, head, _chunks(body)))
         refreshed += 1 if uri in known else 0
         added += 0 if uri in known else 1
+    for path in walk_txt(root):
+        uri = to_kb_uri(root, path)
+        seen.add(uri)
+        mtime = path.stat().st_mtime
+        if uri in known and known[uri] == mtime:
+            continue
+        try:
+            text = path.read_text()
+        except Exception:
+            continue
+        title = path.stem.replace("-", " ")
+        con.execute("DELETE FROM docs WHERE path = ?", (uri,))
+        con.execute(
+            "INSERT INTO docs (id,title,topics,participants,summary,extra,body,path) "
+            "VALUES (?,?,?,?,?,?,?,?)", ("", title, "", "", "", "", text, uri))
+        con.execute(
+            "INSERT OR REPLACE INTO meta VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (uri, mtime, None, "attachment", None, title, None, None, "", ""))
+        pending.append((uri, title, _chunks(text)))
+        refreshed += 1 if uri in known else 0
+        added += 0 if uri in known else 1
+    if pending:
+        texts, keys = [], []
+        for uri, head, chunks in pending:
+            texts.append(head)
+            keys.append((uri, "head"))
+            for i, c in enumerate(chunks):
+                texts.append(c)
+                keys.append((uri, f"chunk:{i}"))
+        vecs = _embed(root, texts)
+        if vecs is not None:
+            for uri, _, _ in pending:
+                con.execute("DELETE FROM vectors WHERE path = ?", (uri,))
+            for (uri, kind), v in zip(keys, vecs):
+                con.execute("INSERT OR REPLACE INTO vectors VALUES (?,?,?,?)",
+                            (uri, kind, v.shape[0], v.tobytes()))
+            con.execute("INSERT OR REPLACE INTO kv VALUES ('embed_model', ?)",
+                        (EMBED_MODEL,))
     gone = set(known) - seen
     for uri in gone:
         con.execute("DELETE FROM meta WHERE path = ?", (uri,))
         con.execute("DELETE FROM docs WHERE path = ?", (uri,))
+        con.execute("DELETE FROM vectors WHERE path = ?", (uri,))
     con.commit()
     n = con.execute("SELECT count(*) FROM meta").fetchone()[0]
     if not args.quiet:
@@ -274,24 +422,100 @@ def ensure_index(root: Path) -> sqlite3.Connection:
 # -------------------------------------------------------------------- search
 
 def fts_query(raw: str) -> str:
-    toks = re.findall(r"[A-Za-z0-9_]+", raw)
-    if not toks:
+    # Quoted spans become FTS phrase terms ('"recovery update"' matches adjacent
+    # tokens in order); everything else stays a bag-of-words OR.
+    terms: list[str] = []
+    for phrase in re.findall(r'"([^"]+)"', raw):
+        words = re.findall(r"[A-Za-z0-9_]+", phrase)
+        if words:
+            terms.append('"' + " ".join(words) + '"')
+    rest = re.sub(r'"[^"]*"', " ", raw)
+    terms += [f'"{t}"' for t in re.findall(r"[A-Za-z0-9_]+", rest)]
+    if not terms:
         sys.exit("kb search: query has no searchable tokens")
-    return " OR ".join(f'"{t}"' for t in toks)
+    return " OR ".join(terms)
 
 
 # column weights: id, title, topics, participants, summary, extra, body, path
 BM25_WEIGHTS = "4.0, 8.0, 6.0, 3.0, 5.0, 4.0, 1.0, 0.0"
 
+RRF_K = 60
+CANDIDATES = 50  # per-leg depth feeding the fusion
+
+
+def bm25_leg(con, raw_query: str, limit: int = CANDIDATES) -> list[tuple[str, float]]:
+    """[(path, bm25_score_negated_better_bigger)], best first."""
+    sql = (f"SELECT docs.path, bm25(docs, {BM25_WEIGHTS}) AS score "
+           f"FROM docs WHERE docs MATCH ? ORDER BY score LIMIT ?")
+    return [(r[0], -r[1]) for r in con.execute(sql, (fts_query(raw_query), limit))]
+
+
+def vector_leg(root: Path, con, raw_query: str,
+               limit: int = CANDIDATES) -> list[tuple[str, float]]:
+    """[(path, cosine)], best first; doc score = max over its vectors, small
+    head boost so distilled matches beat transcript-noise matches."""
+    q = _embed(root, [raw_query])
+    if q is None:
+        return []
+    rows = con.execute("SELECT path, kind, vec FROM vectors").fetchall()
+    if not rows:
+        return []
+    import numpy as np
+    mat = np.frombuffer(b"".join(r[2] for r in rows),
+                        dtype=np.float32).reshape(len(rows), -1)
+    scores = mat @ q[0]
+    best: dict[str, float] = {}
+    for (path, kind, _), s in zip(rows, scores):
+        s = float(s) * (1.05 if kind == "head" else 1.0)
+        if s > best.get(path, -2.0):
+            best[path] = s
+    return sorted(best.items(), key=lambda x: -x[1])[:limit]
+
+
+def fuse_rrf(*legs: list[tuple[str, float]]) -> list[tuple[str, float]]:
+    scores: dict[str, float] = {}
+    for leg in legs:
+        for rank, (path, _s) in enumerate(leg):
+            scores[path] = scores.get(path, 0.0) + 1.0 / (RRF_K + rank + 1)
+    return sorted(scores.items(), key=lambda x: -x[1])
+
+
+def ranked_paths(root: Path, con, raw_query: str, mode: str) -> tuple[str, list, dict, dict]:
+    """Resolve mode, run the legs, fuse. Returns (effective_mode,
+    [(path, score)], bm_ranks, vec_ranks)."""
+    has_vecs = con.execute("SELECT 1 FROM vectors LIMIT 1").fetchone()
+    if mode == "hybrid" and not has_vecs:
+        mode = "lexical"
+    if mode == "vector" and not has_vecs:
+        sys.exit("kb search: no vectors in the index — run `kb index` with network "
+                 "access once (or unset KB_NO_EMBED)")
+    bm = bm25_leg(con, raw_query) if mode in ("lexical", "hybrid") else []
+    vec = vector_leg(root, con, raw_query) if mode in ("vector", "hybrid") else []
+    if mode == "hybrid" and not vec:
+        mode = "lexical"  # encoder unavailable right now — degrade silently
+    bm_ranks = {p: i + 1 for i, (p, _) in enumerate(bm)}
+    vec_ranks = {p: i + 1 for i, (p, _) in enumerate(vec)}
+    if mode == "lexical":
+        return mode, bm, bm_ranks, vec_ranks
+    if mode == "vector":
+        return mode, vec, bm_ranks, vec_ranks
+    return mode, fuse_rrf(bm, vec), bm_ranks, vec_ranks
+
 
 def cmd_search(args) -> int:
     root = kb_root()
     con = ensure_index(root)
-    sql = (f"SELECT m.id, m.path, m.doctype, m.status, m.title, m.created, m.topics, "
-           f"bm25(docs, {BM25_WEIGHTS}) AS score, docs.summary "
-           f"FROM docs JOIN meta m ON m.path = docs.path "
-           f"WHERE docs MATCH ?")
-    params: list[object] = [fts_query(" ".join(args.query))]
+    mode, cand, bm_ranks, vec_ranks = ranked_paths(
+        root, con, " ".join(args.query), args.mode)
+    if not cand:
+        print("no hits")
+        return 1
+    # filters apply post-fusion — cheap at this scale, and identical across modes
+    qmarks = ",".join("?" * len(cand))
+    sql = (f"SELECT m.path, m.id, m.doctype, m.status, m.title, m.created, m.topics, "
+           f"(SELECT summary FROM docs WHERE docs.path = m.path) "
+           f"FROM meta m WHERE m.path IN ({qmarks})")
+    params: list[object] = [p for p, _ in cand]
     if args.type != "all":
         sql += " AND m.doctype = ?"
         params.append(args.type)
@@ -308,23 +532,28 @@ def cmd_search(args) -> int:
     for p in args.person or []:
         sql += " AND (',' || replace(m.participants, ' ', '') || ',') LIKE ?"
         params.append(f"%,{p},%")
-    sql += " ORDER BY score LIMIT ?"
-    params.append(args.n)
-    rows = con.execute(sql, params).fetchall()
+    meta = {r[0]: r[1:] for r in con.execute(sql, params)}
+    hits = [(p, s) for p, s in cand if p in meta][: args.n]
     if args.json:
-        out = [{"id": r[0], "path": str(from_kb_uri(root, r[1])), "kb_path": r[1],
-                "type": r[2], "status": r[3], "title": r[4], "created": r[5],
-                "topics": r[6], "score": round(-r[7], 3), "summary": first_line(r[8])}
-               for r in rows]
+        out = []
+        for uri, score in hits:
+            rid, doctype, status, title, created, topics, summary = meta[uri]
+            out.append({"id": rid, "path": str(from_kb_uri(root, uri)), "kb_path": uri,
+                        "type": doctype, "status": status, "title": title,
+                        "created": created, "topics": topics,
+                        "score": round(score, 4), "mode": mode,
+                        "bm25_rank": bm_ranks.get(uri), "vec_rank": vec_ranks.get(uri),
+                        "summary": first_line(summary)})
         print(json.dumps(out, indent=2, ensure_ascii=False))
         return 0
-    if not rows:
+    if not hits:
         print("no hits")
         return 1
-    for r in rows:
-        rid, uri, doctype, status, title, created, topics, score, summary = r
+    for uri, score in hits:
+        rid, doctype, status, title, created, topics, summary = meta[uri]
         label = doctype + ("" if status in (None, "active") else f", {status}")
-        print(f"[{-score:6.2f}] {rid or uri}  ({label})")
+        shown = f"{score:6.2f}" if mode != "hybrid" else f"{score:6.4f}"
+        print(f"[{shown}] {rid or uri}  ({label})")
         print(f"         file: {from_kb_uri(root, uri)}")
         print(f"         title: {title}" + (f"  ({created[:10]})" if created else ""))
         if topics:
@@ -332,6 +561,61 @@ def cmd_search(args) -> int:
         if summary:
             print(f"         summary: {first_line(summary)}")
     return 0
+
+
+# ---------------------------------------------------------------------- eval
+
+def cmd_eval(args) -> int:
+    """Retrieval quality over the gold set in $KB_DATA_DIR/_eval.yaml.
+
+    Cases: `- q: <natural query>` + `expect: [id, ...]` (any expected id counts).
+    `expect: []` rows are the no-hit calibration set (used by auto-recall
+    thresholding); they're skipped for ranking metrics.
+    """
+    root = kb_root()
+    con = ensure_index(root)
+    eval_path = root / "_eval.yaml"
+    if not eval_path.exists():
+        sys.exit(f"kb eval: no gold set at {eval_path}")
+    cases = yaml.load(eval_path.read_text(), Loader=StrLoader) or []
+    scored = [c for c in cases if c.get("expect")]
+    if not scored:
+        sys.exit("kb eval: gold set has no cases with expectations")
+    has_vecs = con.execute("SELECT 1 FROM vectors LIMIT 1").fetchone()
+    modes = [args.mode] if args.mode != "all" else (
+        ["lexical", "vector", "hybrid"] if has_vecs else ["lexical"])
+    id_of = {r[0]: r[1] for r in con.execute(
+        "SELECT path, id FROM meta WHERE id IS NOT NULL")}
+    results: dict[str, float] = {}
+    print(f"kb eval: {len(scored)} scored case(s), "
+          f"{len(cases) - len(scored)} no-hit case(s) held for recall calibration")
+    print(f"{'mode':<8} {'MRR@10':>7} {'R@1':>6} {'R@5':>6}")
+    for mode in modes:
+        mrr = r1 = r5 = 0.0
+        for c in scored:
+            _, cand, _, _ = ranked_paths(root, con, str(c["q"]), mode)
+            ids = [id_of[p] for p, _ in cand if p in id_of][:10]
+            rank = next((i + 1 for i, x in enumerate(ids) if x in c["expect"]), None)
+            if rank:
+                mrr += 1.0 / rank
+                r1 += rank == 1
+                r5 += rank <= 5
+        n = len(scored)
+        results[mode] = mrr / n
+        print(f"{mode:<8} {mrr / n:>7.3f} {r1 / n:>6.2f} {r5 / n:>6.2f}")
+    rc = 0
+    for mode in modes:
+        row = con.execute("SELECT v FROM kv WHERE k = ?", (f"eval_mrr_{mode}",)).fetchone()
+        if args.save_baseline:
+            con.execute("INSERT OR REPLACE INTO kv VALUES (?, ?)",
+                        (f"eval_mrr_{mode}", f"{results[mode]:.4f}"))
+            con.commit()
+        elif row and results[mode] < float(row[0]) - 0.02:
+            print(f"REGRESSION: {mode} MRR {results[mode]:.3f} < baseline {row[0]}")
+            rc = 1
+    if args.save_baseline:
+        print("baselines saved")
+    return rc
 
 
 # ---------------------------------------------------------------------- show
@@ -507,6 +791,10 @@ def yflow(items: list) -> str:
     return "[" + ", ".join(ydump(i) for i in items) + "]"
 
 
+ROUTE_KNOWN_KEYS = frozenset({"type", "folder", "title", "purpose", "last_indexed",
+                              "topics", "subroutes", "entries", "related"})
+
+
 def emit_route(fm: dict, body: str) -> str:
     lines = ["---", "type: route",
              f"folder: {fm['folder']}",
@@ -529,6 +817,11 @@ def emit_route(fm: dict, body: str) -> str:
     lines.append("related:" if rel else "related: []")
     for r in rel:
         lines.append(f"  - {r}")
+    # round-trip anything we don't own — hand-added route metadata must survive sync
+    extra = {k: v for k, v in fm.items() if k not in ROUTE_KNOWN_KEYS}
+    if extra:
+        lines.append(yaml.safe_dump(extra, sort_keys=False, allow_unicode=True,
+                                    width=10 ** 6).strip())
     lines.append("---")
     return "\n".join(lines) + "\n" + body
 
@@ -1084,9 +1377,11 @@ def main() -> int:
     p.add_argument("--quiet", action="store_true")
     p.set_defaults(fn=cmd_index)
 
-    p = sub.add_parser("search", help="BM25 full-text search")
+    p = sub.add_parser("search", help="hybrid (BM25 + vector, RRF-fused) full-text search")
     p.add_argument("query", nargs="+")
     p.add_argument("-n", type=int, default=10, help="max hits (default 10)")
+    p.add_argument("--mode", choices=["hybrid", "lexical", "vector"], default="hybrid",
+                   help="hybrid falls back to lexical when no vectors exist")
     p.add_argument("--type", choices=["entry", "recipe", "model", "problem", "route", "all"], default="all")
     p.add_argument("--topic", action="append", help="require a topic tag (repeatable)")
     p.add_argument("--person", action="append", help="require a participant (repeatable)")
@@ -1095,6 +1390,12 @@ def main() -> int:
     p.add_argument("--routes", action="store_true", help="include _route.md hits")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_search)
+
+    p = sub.add_parser("eval", help="retrieval quality over the _eval.yaml gold set")
+    p.add_argument("--mode", choices=["all", "hybrid", "lexical", "vector"], default="all")
+    p.add_argument("--save-baseline", action="store_true",
+                   help="store current MRR per mode as the regression baseline")
+    p.set_defaults(fn=cmd_eval)
 
     p = sub.add_parser("show", help="resolve an id / kb:/ URI / path and print it")
     p.add_argument("ref")
