@@ -694,6 +694,18 @@ def cmd_edges(args) -> int:
     rev = con.execute(
         "SELECT kind, src FROM edges WHERE target = ? OR target = "
         "(SELECT path FROM meta WHERE id = ?) ORDER BY kind", (rid, rid)).fetchall()
+    if args.json:
+        def jdesc(ref: str) -> dict:
+            row = con.execute(
+                "SELECT title, status FROM meta WHERE path = ? OR id = ?",
+                (ref, ref)).fetchone()
+            return {"ref": ref, "title": row[0] if row else None,
+                    "status": row[1] if row else None, "missing": row is None}
+        print(json.dumps({
+            "forward": [{"kind": k, **jdesc(t)} for k, t in fwd],
+            "reverse": [{"kind": k, **jdesc(s)} for k, s in rev],
+        }, indent=2, ensure_ascii=False))
+        return 0
     if not fwd and not rev:
         print(f"no edges for '{rid}'")
         return 0
@@ -1615,6 +1627,17 @@ def cmd_recall(args) -> int:
     return 0
 
 
+# --------------------------------------------------------------------- serve
+
+def cmd_serve(args) -> int:
+    """Exec the sibling MCP server (own PEP 723 dep block — the mcp SDK's
+    dependency weight never rides along on normal kb invocations)."""
+    server = engine_dir() / "scripts" / "kb-mcp"
+    if not server.exists():
+        sys.exit(f"kb serve: missing {server}")
+    os.execvp("uv", ["uv", "run", "--quiet", str(server)])
+
+
 # ---------------------------------------------------------------------- main
 
 def main() -> int:
@@ -1666,7 +1689,12 @@ def main() -> int:
 
     p = sub.add_parser("edges", help="typed edges for an id, forward and reverse")
     p.add_argument("id")
+    p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_edges)
+
+    p = sub.add_parser("serve", help="serve the KB read-only over MCP (stdio)")
+    p.add_argument("--mcp", action="store_true", help="(the only mode — explicit for clarity)")
+    p.set_defaults(fn=cmd_serve)
 
     p = sub.add_parser("routes", help="emit the route layer + BASELINE metrics")
     p.add_argument("--compact", action="store_true",

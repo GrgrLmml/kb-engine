@@ -42,15 +42,19 @@ is hardcoded to one machine.
 `$KB_ENGINE_DIR/scripts/kb` is the deterministic core. When working **on this repo or
 with the KB**, prefer it over manual find/grep pipelines:
 
-- `kb search <terms>` — ranked BM25 search (self-refreshing index). `--type recipe`, `--topic`, `--person`, `--all-status`, `--json`.
+- `kb search <terms>` — hybrid ranked search: BM25 ∪ local vectors (model2vec), RRF-fused (self-refreshing index; `--mode lexical|vector|hybrid`, silent lexical fallback without the model). `--type recipe|model|problem|…`, `--topic`, `--person`, `--all-status`, `--json`. Quoted spans are phrase matches.
 - `kb show <id>` / `kb show --path <id>` — resolve any id / `kb:/` URI / path.
 - `kb edges <id>` — typed edges, forward and reverse.
 - `kb routes [--compact|--deep]` — the route layer + BASELINE size metrics.
 - `kb sync` — after writing any leaf: regenerates route `entries[]`/`subroutes[]`/`last_indexed`, normalizes topics, refreshes the index. Never hand-edit those route fields.
 - `kb doctor` — broken refs, stale recipes, evidence drift (newer entries in an active recipe's topic area since it was last verified/edited → `drift-risk`), route drift.
 - `kb problems scan|list|brief|resolve|drop` — the epistemic ledger (`kb:/problems/`, `type: problem`): doctor findings made durable with a lifecycle (`open → ready → resolved|dropped`). `scan` mints/reconciles stubs deterministically; `/criticize` writes each stub's pre-registered crucial experiment (`ready`); `/run-experiment` observes and resolves. `resolve` requires `--by <episode-id>` — no resolution without filed evidence.
+- `kb eval [--recall] [--save-baseline]` — retrieval-quality metrics (MRR/recall) over the `_eval.yaml` gold set; `--recall` calibrates the auto-recall thresholds against the no-hit set.
+- `kb ambient [--cwd PATH]` — the tiered SessionStart payload (folder map + cwd-relevant entry lists + problem/digest/capture deltas).
+- `kb recall` (prompt on stdin) — semantic auto-recall: at most 3 relevant leaves or silence; session-deduped. Powers the UserPromptSubmit hook.
+- `kb serve --mcp` — read-only MCP server (stdio) over the same CLI, for clients outside Claude Code (`scripts/kb-mcp`).
 
-A compact KB index is auto-injected into new sessions as `<kb-ambient-index>` (SessionStart hook). The `kb-recall` skill reaches into the KB proactively.
+The tiered ambient payload is auto-injected into new sessions as `<kb-ambient-index>` (SessionStart hook): folder map always, full entry lists only for KB folders matching the session's repo, plus problem-ledger and nightly-digest deltas. A UserPromptSubmit hook (`auto-recall.sh` → `kb recall`) surfaces up to 3 relevant leaves per prompt, calibrated to stay silent on irrelevant ones. The `kb-recall` skill reaches into the KB proactively. A nightly launchd agent (`scripts/librarian-nightly`) validates, auto-commits kb-data, syncs, diffs doctor findings, reconciles the problem ledger, rotates logs, and writes a digest — plus one weekly headless `/criticize` pass, WIP-gated on unrun experiments.
 
 ## Commands
 
@@ -58,8 +62,7 @@ Run any of these in a Claude Code session once installed:
 
 - `/find <query>` — ranked search; pulls best matches to WARM tier, follows curated edges.
 - `/ask <question>` — answer a question from the KB via the cheap `kb-researcher` subagent (Haiku reads the transcripts, main context gets only the distilled cited answer). The `kb-recall` skill takes this same route automatically for plain questions.
-- `/load-kb [--deep] [query]` — load the whole index into context (high-recall baseline).
-- `/file-this [hint]` — file the current conversation into the KB.
+- `/file-this [--bg] [hint]` — file the current conversation into the KB (`--bg`: hand it to a background librarian and keep working).
 - `/jot <fact>` — capture a small durable fact in seconds (minimal leaf, no transcript).
 - `/start <intent>` — bootstrap a session with relevant KB context.
 - `/promote <id>` — load an entry's full transcript (HOT tier).
@@ -68,7 +71,8 @@ Run any of these in a Claude Code session once installed:
 - `/theorize [kb:/folder]` — the theory layer's growth pass: harvest open problems, conjecture explanatory models (falsifiable hard-to-vary claims, `kb:/models/`) through a criticism gate, chain model statements into derived conclusions, flag premise contradictions.
 - `/criticize [model-id]` — the criticism pass: attack live models (hard-to-vary, consistency, counterexample sweep), conjecture rivals for lone hypotheses, write pre-registered crucial experiments into the problem ledger.
 - `/run-experiment [problem-id]` — execute one `ready` experiment from the ledger using the session's real tools (Datadog/BigQuery/Slack MCP), map the result onto the pre-registered outcomes, and resolve: winner corroborated, loser refuted or narrowed. Closes the conjecture-and-criticism loop.
-- `/split` · `/collapse` · `/dedup` · `/tidy` — librarian housekeeping passes (`/tidy` also runs the recipe-mining pass).
+- `/dedup` · `/tidy` — librarian housekeeping (`/tidy` runs split + collapse + dedup + recipe-mining passes; the standalone split/collapse commands are retired).
+- `/graduate-recipe <id>` — turn a proven recipe into a personal Claude Code skill (`~/.claude/skills/`), recipe stays as provenance.
 
 ## Layout
 
@@ -76,8 +80,8 @@ Run any of these in a Claude Code session once installed:
 - `skills/` — proactive skills (`kb-recall`), symlinked into `~/.claude/skills` by install.
 - `agents/` — subagent definitions (`kb-researcher`: cheap read-only transcript extraction), symlinked into `~/.claude/agents` by install.
 - `librarian/` — the canonical filing/split/collapse/dedup/extract-recipe/mine-recipes/theorize procedures.
-- `scripts/` — `kb` (deterministic CLI: search/show/edges/routes/sync/doctor), `validate.py` (schema), `audit-topics.py` (topic normalization), `librarian` (headless).
-- `hooks/` — `session-start.sh` (ambient index + open-problem queue), `normalize-topics.sh` (SessionEnd sweep + index refresh), `auto-recall.sh` (experimental, NOT registered by default), `pre-commit` (kb-data schema validator), `pre-commit-no-leaks` (ENGINE repo leak guard: blocks commits containing terms from the private `$KB_DATA_DIR/_banned-terms.txt` — this repo is public, KB content must never leak in), `session-end.sh` (legacy auto-file, off by default).
+- `scripts/` — `kb` (deterministic CLI: search/show/edges/routes/sync/doctor/problems/eval/ambient/recall/serve), `kb-mcp` (read-only MCP adapter over the CLI), `validate.py` (schema), `audit-topics.py` (topic normalization), `librarian` (headless: file/split/collapse/dedup/criticize/mine-recipes), `librarian-nightly` (deterministic nightly job, run by launchd).
+- `hooks/` — `session-start.sh` (tiered ambient payload via `kb ambient`), `auto-recall.sh` (semantic per-prompt recall via `kb recall`, registered by default), `capture-candidate.sh` (SessionEnd: queues substantial unfiled sessions), `allow-kb-query.sh` (PreToolUse: auto-allows read-only kb queries), `pre-commit` (kb-data schema validator), `pre-commit-no-leaks` (ENGINE repo leak guard: blocks commits containing terms from the private `$KB_DATA_DIR/_banned-terms.txt` — this repo is public, KB content must never leak in), `normalize-topics.sh` (retired from per-session use — nightly `kb sync` covers it), `session-end.sh` (legacy unconditional auto-file, off by default).
 - `docs/schema.md` — the frontmatter contract (leaf entries, recipes, routes). Read it before editing KB files.
 - `docs/plan-day2.md` — the day-2 maturity plan (phases 1–3 shipped; phase 4 trigger-gated).
 - `templates/` — starter files for new entries, recipes, routes, and the topic/tools vocabularies.

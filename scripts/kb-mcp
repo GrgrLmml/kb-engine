@@ -1,0 +1,86 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["mcp>=1.2"]
+# ///
+"""kb-mcp — read-only MCP server over the kb CLI (stdio only, no port).
+
+A deliberately thin adapter: every tool shells out to `scripts/kb`, so the CLI
+stays the single source of truth and this file stays ~100 lines. Point any MCP
+client (claude.ai desktop, other agents) at it:
+
+    { "mcpServers": { "kb": {
+        "command": "uv",
+        "args": ["run", "--quiet", "<KB_ENGINE_DIR>/scripts/kb-mcp"],
+        "env": { "KB_DATA_DIR": "<your kb-data>" } } } }
+
+The server is spawned per-client over stdio and never writes to the KB.
+"""
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+try:  # mcp >= 2.0
+    from mcp.server.mcpserver import MCPServer
+except ImportError:  # mcp 1.x called the same thing FastMCP
+    from mcp.server.fastmcp import FastMCP as MCPServer
+
+ENGINE = Path(__file__).resolve().parent
+KB = str(ENGINE / "kb")
+
+mcp = MCPServer(
+    "kb", instructions="Read-only access to a personal knowledge base: episodic "
+    "entries, reusable recipes, falsifiable models (theory layer), and the "
+    "problem ledger. Start with kb_search or kb_routes; kb_show prints a full "
+    "document; kb_edges walks typed links.")
+
+
+def _run(*args: str) -> str:
+    r = subprocess.run(["uv", "run", "--quiet", KB, *args],
+                       capture_output=True, text=True, timeout=120)
+    if r.returncode not in (0, 1):  # 1 = "no hits"/findings, still useful output
+        return f"kb error (rc={r.returncode}): {r.stderr.strip()}"
+    return r.stdout
+
+
+@mcp.tool()
+def kb_search(query: str, n: int = 10, type: str = "all", mode: str = "hybrid") -> str:
+    """Ranked search over the knowledge base (hybrid BM25+vector by default).
+
+    type: entry | recipe | model | problem | route | all.
+    Returns JSON rows with id, title, summary, score, and rank components.
+    """
+    return _run("search", query, "-n", str(n), "--type", type,
+                "--mode", mode, "--json")
+
+
+@mcp.tool()
+def kb_show(ref: str) -> str:
+    """Print a full KB document by bare id, kb:/ URI, or path."""
+    return _run("show", ref)
+
+
+@mcp.tool()
+def kb_edges(id: str) -> str:
+    """Typed edges for an id (forward and reverse), as JSON."""
+    return _run("edges", id, "--json")
+
+
+@mcp.tool()
+def kb_routes(compact: bool = True) -> str:
+    """The route layer: folder purposes + one line per entry (compact), or the
+    raw _route.md files (compact=False)."""
+    return _run("routes", "--compact") if compact else _run("routes")
+
+
+@mcp.tool()
+def kb_problems(status: str = "") -> str:
+    """The epistemic ledger: open conflicts in the theory layer and their
+    pre-registered crucial experiments. Optional status filter:
+    open | ready | resolved | dropped."""
+    return _run("problems", "list", *(["--status", status] if status else []))
+
+
+if __name__ == "__main__":
+    mcp.run()
