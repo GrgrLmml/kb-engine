@@ -79,8 +79,12 @@ VALIDATE_OUT="$(uv run --quiet "$KB_ENGINE_DIR/scripts/validate.py" 2>&1)" \
   || VALIDATE_LINE="$(printf '%s\n' "$VALIDATE_OUT" | tail -1)"
 
 # --- 2. auto-commit kb-data ------------------------------------------------
+# Opt-out: `touch $KB_DATA_DIR/.no-autocommit` — for owners who keep kb-data
+# uncommitted on purpose (content stays on disk; back it up by other means).
 COMMIT_LINE="kb-data is not a git repo"
-if [ -d "$KB_DATA_DIR/.git" ]; then
+if [ -f "$KB_DATA_DIR/.no-autocommit" ]; then
+  COMMIT_LINE="autosave disabled (.no-autocommit)"
+elif [ -d "$KB_DATA_DIR/.git" ]; then
   cd "$KB_DATA_DIR"
   NDIRTY="$(git status --porcelain | wc -l | tr -d ' ')"
   if [ "$NDIRTY" = 0 ]; then
