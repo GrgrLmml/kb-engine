@@ -26,6 +26,7 @@ This skill is how you pull the actual content.
 
 1. **Search** (milliseconds, index self-refreshes):
    ```sh
+   $KB_ENGINE_DIR/scripts/kb facts <subject-or-prefix>   # when the question is "what is X currently / which / does it": the claim layer answers in one line, with since + source
    $KB_ENGINE_DIR/scripts/kb search <terms> -n 10
    ```
    - Procedural question ("how do we…") → add `--type recipe`.

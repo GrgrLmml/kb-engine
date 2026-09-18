@@ -42,11 +42,15 @@ is hardcoded to one machine.
 `$KB_ENGINE_DIR/scripts/kb` is the deterministic core. When working **on this repo or
 with the KB**, prefer it over manual find/grep pipelines:
 
-- `kb search <terms>` — hybrid ranked search: BM25 ∪ local vectors (model2vec), RRF-fused (self-refreshing index; `--mode lexical|vector|hybrid`, silent lexical fallback without the model). `--type recipe|model|problem|…`, `--topic`, `--person`, `--all-status`, `--json`. Quoted spans are phrase matches.
+- `kb search <terms>` — hybrid ranked search over the distilled fields (title/topics/summary/decisions/steps/statement — transcripts are deliberately not indexed): BM25 ∪ local vectors (model2vec), RRF-fused, doctype prior (episodes first). Self-refreshing index; `--mode lexical|vector|hybrid`, `--type recipe|model|problem|…`, `--topic`, `--person`, `--all-status`, `--json`. Quoted spans are phrase matches.
 - `kb show <id>` / `kb show --path <id>` — resolve any id / `kb:/` URI / path.
 - `kb edges <id>` — typed edges, forward and reverse.
 - `kb routes [--compact|--deep]` — the route layer + BASELINE size metrics.
-- `kb sync` — after writing any leaf: regenerates route `entries[]`/`subroutes[]`/`last_indexed`, normalizes topics, refreshes the index. Never hand-edit those route fields.
+- `kb file --meta - --session auto|<jsonl>` / `kb file --jot --meta -` — the deterministic leaf writer: the LLM distills a small JSON payload (title, summary, topics, decisions, folder…), `kb` does everything clerical (id, timestamps, YAML, machine-rendered transcript, folder bootstrap, schema validation — a leaf that fails the schema is never written — route bookkeeping, index refresh) and reports the same-topic models/recipes to check. `/file-this` and `/jot` are thin wrappers around it.
+- `kb transcript <jsonl>` — render a Claude Code session as a condensed, faithful transcript (what headless filing reads instead of raw JSONL).
+- `kb facts [subject] [--scope k=v] [--as-of DATE] [--history]` — the **claim layer**: episodes carry `claims:` (subject/value/scope/since/kind/source, see `docs/schema.md`); `kb` derives which claim is current per `(subject, scope)` key, what superseded what, what was re-confirmed, what is stale. Most specific scope wins; the unscoped claim is the default. This is how "X is currently Y (since D, source S), except Z" gets served — one line, no transcript.
+- `kb subjects [--match words]` — the subject vocabulary (`_subjects.yaml`, auto-registered by `kb sync`; aliases + decay class hand-curated). Check it before minting a new subject.
+- `kb sync` — after editing any leaf by hand: regenerates route `entries[]`/`subroutes[]`/`last_indexed`, normalizes topics, refreshes the index. Never hand-edit those route fields.
 - `kb doctor` — broken refs, stale recipes, evidence drift (newer entries in an active recipe's topic area since it was last verified/edited → `drift-risk`), route drift.
 - `kb problems scan|list|brief|resolve|drop` — the epistemic ledger (`kb:/problems/`, `type: problem`): doctor findings made durable with a lifecycle (`open → ready → resolved|dropped`). `scan` mints/reconciles stubs deterministically; `/criticize` writes each stub's pre-registered crucial experiment (`ready`); `/run-experiment` observes and resolves. `resolve` requires `--by <episode-id>` — no resolution without filed evidence.
 - `kb eval [--recall] [--save-baseline]` — retrieval-quality metrics (MRR/recall) over the `_eval.yaml` gold set; `--recall` calibrates the auto-recall thresholds against the no-hit set.

@@ -20,12 +20,34 @@ ENGINE="${KB_ENGINE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cmd=$(jq -r '.tool_input.command // empty')
 [ -z "$cmd" ] && exit 0
 
+# Heredoc bodies (`kb file --meta - <<'JSON' … JSON`, `kb check <<'TXT' … TXT`)
+# are DATA for a kb command, not further commands: strip them before the
+# segment split so the payload's own punctuation can't fall through to a prompt.
+cmd=$(printf '%s\n' "$cmd" | python3 -c '
+import re, sys
+text = sys.stdin.read()
+out, skip = [], None
+for line in text.splitlines():
+    if skip is not None:
+        if line.strip() == skip:
+            skip = None
+        continue
+    m = re.search(r"<<-?\s*[\x27\"]?([A-Za-z_][A-Za-z0-9_]*)[\x27\"]?\s*$", line)
+    if m:
+        skip = m.group(1)
+        line = line[: m.start()]
+    out.append(line)
+print("\n".join(out))
+' 2>/dev/null || printf '%s\n' "$cmd")
+
 is_kb_engine_cmd() {
   local seg="$1" rest=""
   case "$seg" in
     "\$KB_ENGINE_DIR/scripts/"*)     rest="${seg#\$KB_ENGINE_DIR/scripts/}" ;;
     "\"\$KB_ENGINE_DIR\"/scripts/"*) rest="${seg#\"\$KB_ENGINE_DIR\"/scripts/}" ;;
+    "\"\$KB_ENGINE_DIR/scripts/"*)   rest="${seg#\"\$KB_ENGINE_DIR/scripts/}"; rest="${rest/\"/}" ;;
     "$ENGINE/scripts/"*)             rest="${seg#"$ENGINE"/scripts/}" ;;
+    "\"$ENGINE/scripts/"*)           rest="${seg#\""$ENGINE"/scripts/}"; rest="${rest/\"/}" ;;
     *) return 1 ;;
   esac
   case "$rest" in

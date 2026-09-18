@@ -11,7 +11,18 @@ model.
 
 Subcommands:
   index            build/refresh the search index: FTS5 + local embeddings (incremental, by mtime)
-  search QUERY     hybrid-ranked (BM25 ∪ vector, RRF) search over frontmatter + body
+  search QUERY     hybrid-ranked (BM25 ∪ vector, RRF) search over the DISTILLED fields
+                   (title/topics/summary/decisions/steps/statement). Transcript bodies are
+                   deliberately not indexed — they are HOT-tier payload for kb-researcher
+  file             write a leaf deterministically from an LLM-distilled JSON payload
+                   (+ machine-rendered transcript), validate, sync, report same-topic
+                   models/recipes. --jot: no transcript. The LLM judges; this writes.
+  transcript PATH  render a Claude Code session JSONL as a condensed, faithful transcript
+  facts [SUBJECT]  the claim layer: current value per (subject, scope), exceptions, history,
+                   --as-of DATE; claims live in episode frontmatter, the view is derived
+  subjects         the subject vocabulary (_subjects.yaml): keys, aliases, decay class, counts
+  check            (text on stdin) the KB's current claims on every subject the text touches —
+                   the LLM compares and reports contradictions with since/source
   eval             retrieval-quality metrics (MRR/recall) over the _eval.yaml gold set
   show ID|URI|PATH resolve an entry and print it (--path: print the path only)
   edges ID         resolved typed edges, forward AND reverse ("what links here")
@@ -23,7 +34,9 @@ Subcommands:
   problems         the epistemic ledger: scan | list | brief | resolve | drop
 
 The index lives at $KB_DATA_DIR/.index/kb.db (gitignored, disposable — rebuilt
-from the markdown at any time).
+from the markdown at any time). KB_INDEX_DB=<path> points at an alternative db
+(isolated retrieval experiments: build a variant, run `kb eval`, compare);
+KB_EMBED_MODEL overrides the embedding model the same way.
 """
 from __future__ import annotations
 
@@ -58,7 +71,7 @@ def engine_dir() -> Path:
 def db_path(root: Path) -> Path:
     d = root / ".index"
     d.mkdir(exist_ok=True)
-    return d / "kb.db"
+    return Path(os.environ["KB_INDEX_DB"]) if os.environ.get("KB_INDEX_DB") else d / "kb.db"
 
 
 def to_kb_uri(root: Path, p: Path) -> str:
@@ -139,7 +152,7 @@ def first_line(s: object, limit: int = 200) -> str:
 
 # Bump SCHEMA_VERSION whenever the FTS shape or tokenizer changes: the index is
 # documented-disposable, so a mismatch just drops and rebuilds it transparently.
-SCHEMA_VERSION = "2"  # 2: porter stemming, attachments, vectors table
+SCHEMA_VERSION = "4"  # 4: claims table + claim docs
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -172,6 +185,22 @@ CREATE TABLE IF NOT EXISTS vectors (
   vec BLOB NOT NULL,            -- float32, L2-normalized at write time
   PRIMARY KEY (path, kind)
 );
+CREATE TABLE IF NOT EXISTS claims (
+  path TEXT PRIMARY KEY,        -- claim:<episode-id>:<n>
+  episode TEXT NOT NULL,        -- asserting episode id
+  subject TEXT NOT NULL,        -- dotted key from _subjects.yaml
+  scope TEXT NOT NULL,          -- canonical 'k=v;k=v' ('' = default)
+  value TEXT NOT NULL,
+  value_norm TEXT NOT NULL,
+  since TEXT NOT NULL,          -- YYYY-MM-DD the value became true
+  kind TEXT NOT NULL,           -- observed | inferred | reported
+  source TEXT,
+  asserted TEXT NOT NULL,       -- episode created (bi-temporal: when we learned it)
+  valid_to TEXT,                -- set by supersession (derived, never hand-written)
+  superseded_by TEXT,           -- claim path
+  confirmed TEXT                -- latest later same-value assertion (derived)
+);
+CREATE INDEX IF NOT EXISTS idx_claims_key ON claims(subject, scope);
 CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
 """
 
@@ -182,7 +211,7 @@ def open_db(root: Path) -> sqlite3.Connection:
     row = con.execute("SELECT v FROM kv WHERE k = 'schema_version'").fetchone()
     if row is None or row[0] != SCHEMA_VERSION:
         # disposable by contract — drop and let the caller repopulate
-        for t in ("docs", "meta", "edges", "vectors"):
+        for t in ("docs", "meta", "edges", "vectors", "claims"):
             con.execute(f"DROP TABLE IF EXISTS {t}")
         con.execute("INSERT OR REPLACE INTO kv VALUES ('schema_version', ?)",
                     (SCHEMA_VERSION,))
@@ -228,6 +257,223 @@ def doc_fields(fm: dict, body: str, doctype: str) -> dict:
     }
 
 
+# ------------------------------------------------------------------- claims
+#
+# A claim is a decision with a key: "subject X currently has value V (in scope
+# S), since D". Claims live in the asserting episode's frontmatter (`claims:`),
+# so provenance is free and episodes stay immutable. Everything else — which
+# claim is current, what superseded what, what was re-confirmed, what is stale
+# — is DERIVED here from the (subject, scope) key and dates. No similarity, no
+# LLM: same key + later `since` + different value = supersession; same value =
+# confirmation. Scope resolution: the most specific matching scope wins, the
+# unscoped claim is the default.
+
+CLAIM_KINDS = ("observed", "inferred", "reported")
+SUBJECT_RE = re.compile(r"^[a-z0-9]+(\.[a-z0-9][a-z0-9-]*)+$")
+
+
+def norm_value(v: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(v).lower()).strip()
+
+
+# Two claims on one key can differ in words while stating the same fact — a
+# terser restatement, or the same thing described from another episode. That is
+# a confirmation, not a contradiction. Content-word containment separates the
+# two cheaply: a restatement repeats most of the shorter claim's vocabulary, a
+# real disagreement ("BM25" vs "dense cosine") does not.
+RESTATEMENT_MIN = 0.7
+
+
+def is_restatement(a: str, b: str) -> bool:
+    wa = {w for w in a.split() if len(w) > 2}
+    wb = {w for w in b.split() if len(w) > 2}
+    if not wa or not wb:
+        return a == b
+    return len(wa & wb) / min(len(wa), len(wb)) >= RESTATEMENT_MIN
+
+
+def scope_key(scope: object) -> str:
+    """Canonical scope string: 'k=v;k=v', list values sorted and |-joined."""
+    if not isinstance(scope, dict) or not scope:
+        return ""
+    parts = []
+    for k in sorted(scope):
+        v = scope[k]
+        vs = "|".join(sorted(str(x) for x in v)) if isinstance(v, list) else str(v)
+        parts.append(f"{k}={vs}")
+    return ";".join(parts)
+
+
+def parse_scope(s: str) -> dict[str, set[str]]:
+    out: dict[str, set[str]] = {}
+    for part in filter(None, s.split(";")):
+        k, _, v = part.partition("=")
+        out[k] = set(v.split("|"))
+    return out
+
+
+def scope_matches(claim_scope: str, want: dict[str, str]) -> bool:
+    """A claim applies to `want` when every scope dimension it fixes is satisfied."""
+    for k, vals in parse_scope(claim_scope).items():
+        if k not in want or want[k] not in vals:
+            return False
+    return True
+
+
+def episode_claims(fm: dict) -> list[dict]:
+    """Normalize the `claims:` list of one episode; invalid items are skipped
+    (the validator reports them — the index never guesses)."""
+    out = []
+    eid = str(fm.get("id") or "")
+    default_since = str(fm.get("created") or "")[:10]
+    for n, c in enumerate(fm.get("claims") or [], start=1):
+        if not isinstance(c, dict):
+            continue
+        subject = str(c.get("subject") or "").strip().lower()
+        value = str(c.get("value") or "").strip()
+        if not SUBJECT_RE.match(subject) or not value:
+            continue
+        since = str(c.get("since") or default_since)[:10]
+        kind = str(c.get("kind") or "observed")
+        if kind not in CLAIM_KINDS:
+            kind = "observed"
+        out.append({"path": f"claim:{eid}:{n}", "episode": eid, "subject": subject,
+                    "scope": scope_key(c.get("scope")), "value": value,
+                    "value_norm": norm_value(value), "since": since, "kind": kind,
+                    "source": str(c["source"]) if c.get("source") else None,
+                    "asserted": str(fm.get("created") or "")})
+    return out
+
+
+def index_claims(con: sqlite3.Connection, fm: dict, uri: str, mtime: float) -> list[tuple[str, str]]:
+    """Replace this episode's claim rows + claim docs. Returns (path, head) pairs
+    for embedding. Supersession is recomputed globally afterwards (derive_claims)."""
+    eid = str(fm.get("id") or "")
+    if not eid:
+        return []
+    old = [r[0] for r in con.execute("SELECT path FROM claims WHERE episode = ?", (eid,))]
+    for cpath in old:
+        con.execute("DELETE FROM claims WHERE path = ?", (cpath,))
+        con.execute("DELETE FROM docs WHERE path = ?", (cpath,))
+        con.execute("DELETE FROM meta WHERE path = ?", (cpath,))
+        con.execute("DELETE FROM vectors WHERE path = ?", (cpath,))
+    pending = []
+    for c in episode_claims(fm):
+        con.execute(
+            "INSERT INTO claims (path,episode,subject,scope,value,value_norm,since,kind,"
+            "source,asserted) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (c["path"], eid, c["subject"], c["scope"], c["value"], c["value_norm"],
+             c["since"], c["kind"], c["source"], c["asserted"]))
+        title = f"{c['subject']}" + (f" [{c['scope']}]" if c["scope"] else "") + f" = {c['value']}"
+        head = f"{c['subject'].replace('.', ' ')} {c['value']}"
+        con.execute(
+            "INSERT INTO docs (id,title,topics,participants,summary,extra,body,path) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (f"{eid}#{c['path'].rsplit(':', 1)[1]}", title, "", "", c["value"],
+             c["subject"].replace(".", " ") + " " + c["scope"].replace("=", " "), "", c["path"]))
+        con.execute(
+            "INSERT OR REPLACE INTO meta VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (c["path"], mtime, f"{eid}#{c['path'].rsplit(':', 1)[1]}", "claim", "active",
+             title, c["asserted"], c["asserted"], "", ""))
+        pending.append((c["path"], head))
+    return pending
+
+
+def derive_claims(con: sqlite3.Connection) -> None:
+    """Global pass: for each (subject, scope) key order claims by since, then
+    asserted; a later different value supersedes, a later same value confirms."""
+    con.execute("UPDATE claims SET valid_to = NULL, superseded_by = NULL, confirmed = NULL")
+    rows = con.execute("SELECT path, subject, scope, value_norm, since, asserted FROM claims "
+                       "ORDER BY subject, scope, since, asserted").fetchall()
+    by_key: dict[tuple[str, str], list] = {}
+    for r in rows:
+        by_key.setdefault((r[1], r[2]), []).append(r)
+    for key, chain in by_key.items():
+        current = None  # (path, value_norm, since)
+        for path, _s, _sc, vnorm, since, asserted in chain:
+            if current is None:
+                current = (path, vnorm, since)
+                continue
+            cpath, cnorm, csince = current
+            if vnorm == cnorm or is_restatement(vnorm, cnorm):
+                # confirmation: the standing claim's clock resets. Keep whichever
+                # statement is more specific (longer), fold the other into it.
+                keep, fold = ((path, vnorm, since), (cpath, cnorm, csince)) \
+                    if len(vnorm) > len(cnorm) else ((cpath, cnorm, csince), (path, vnorm, since))
+                con.execute("UPDATE claims SET confirmed = ?, valid_to = NULL, "
+                            "superseded_by = NULL WHERE path = ?", (since, keep[0]))
+                con.execute("UPDATE claims SET valid_to = ?, superseded_by = ? WHERE path = ?",
+                            (fold[2], keep[0], fold[0]))
+                current = keep
+            else:
+                con.execute("UPDATE claims SET valid_to = ?, superseded_by = ? WHERE path = ?",
+                            (since, path, cpath))
+                current = (path, vnorm, since)
+    # visibility: superseded claims leave the default search/recall pool
+    con.execute("UPDATE meta SET status = CASE WHEN (SELECT valid_to FROM claims WHERE "
+                "claims.path = meta.path) IS NULL THEN 'active' ELSE 'superseded' END "
+                "WHERE doctype = 'claim'")
+
+
+def load_subjects(root: Path) -> dict:
+    p = root / "_subjects.yaml"
+    if not p.is_file():
+        return {"subjects": {}, "decay": {}, "defaults": {}}
+    data = yaml.load(p.read_text(), Loader=StrLoader) or {}
+    data.setdefault("subjects", {}); data.setdefault("decay", {}); data.setdefault("defaults", {})
+    data["subjects"] = data["subjects"] or {}
+    return data
+
+
+def subject_decay_days(vocab: dict, subject: str) -> int | None:
+    """Half-life in days after which an unconfirmed claim is stale; None = never."""
+    entry = (vocab["subjects"].get(subject) or {}) if isinstance(vocab["subjects"], dict) else {}
+    cls = entry.get("decay") if isinstance(entry, dict) else None
+    if not cls:
+        cls = (vocab.get("defaults") or {}).get(subject.split(".")[0], "topology")
+    days = (vocab.get("decay") or {}).get(cls, 180)
+    return None if not days else int(days)
+
+
+def register_subjects(root: Path, con: sqlite3.Connection) -> list[str]:
+    """Every subject used by a claim exists in _subjects.yaml (auto-stubbed, like
+    route entries[]); aliases/decay stay hand-curated. Returns newly minted keys."""
+    vocab = load_subjects(root)
+    used = [r[0] for r in con.execute("SELECT DISTINCT subject FROM claims ORDER BY subject")]
+    new = [s for s in used if s not in vocab["subjects"]]
+    if not new:
+        return []
+    p = root / "_subjects.yaml"
+    text = p.read_text() if p.is_file() else SUBJECTS_TEMPLATE
+    if "subjects:" not in text:
+        text = text.rstrip() + "\nsubjects:\n"
+    block = "".join(f"  {s}:\n    aliases: []\n" for s in new)
+    # append under the subjects: mapping (it is the last top-level key by convention)
+    text = text.rstrip() + "\n" + block
+    p.write_text(text)
+    return new
+
+
+SUBJECTS_TEMPLATE = """# Subject vocabulary for claims (`claims:` in episode frontmatter).
+#
+# A subject is a dotted key naming ONE thing that has a current value:
+#   <area>.<thing>.<attribute>   e.g. mt.nn-retrieval.similarity
+# `kb sync` auto-appends any subject a claim uses (stub, no aliases). You curate:
+#   aliases: words/phrases that mean this subject in prose (kb check / recall match on them)
+#   decay:   how fast an unconfirmed claim on it goes stale (class name from `decay:` below)
+# Areas: pick from an existing top-level prefix before inventing one.
+decay:            # class -> days until an unconfirmed claim is reported stale (0 = never)
+  config: 90      # settings, thresholds, routing, versions, deployments
+  topology: 180   # architecture, which service does what, where things live
+  relational: 180 # ownership, roles, who-to-ask
+  never: 0        # recorded decisions/history — true forever as history
+defaults:         # decay class by top-level area when a subject sets none
+  people: relational
+  decision: never
+subjects:
+"""
+
+
 def index_edges(con: sqlite3.Connection, fm: dict) -> None:
     src = fm.get("id")
     if not src:
@@ -252,7 +498,7 @@ def index_edges(con: sqlite3.Connection, fm: dict) -> None:
 # (network) download; everything degrades gracefully to lexical-only without it.
 # Kill switch: KB_NO_EMBED=1.
 
-EMBED_MODEL = "minishlab/potion-retrieval-32M"
+EMBED_MODEL = os.environ.get("KB_EMBED_MODEL", "minishlab/potion-retrieval-32M")
 
 
 def _encoder(root: Path):
@@ -325,6 +571,7 @@ def cmd_index(args) -> int:
         con.execute("DELETE FROM vectors")
         known = {}
     seen, added, refreshed = set(), 0, 0
+    claims_dirty = bool(args.rebuild)
     pending: list[tuple[str, str, list[str]]] = []  # (uri, head text, body chunks)
     for path in walk_md(root):
         uri = to_kb_uri(root, path)
@@ -340,6 +587,11 @@ def cmd_index(args) -> int:
                    else "model" if fm.get("type") == "model"
                    else "problem" if fm.get("type") == "problem" else "entry")
         d = doc_fields(fm, body, doctype)
+        # Transcript bodies are NOT indexed (measured 2026-09-16 on _eval.yaml:
+        # body text and body chunk vectors both lowered MRR — they let a long
+        # transcript outrank the entry whose summary actually answers). The
+        # distilled fields are the retrieval surface; the body is HOT payload.
+        d["body"] = ""
         con.execute("DELETE FROM docs WHERE path = ?", (uri,))
         con.execute(
             "INSERT INTO docs (id,title,topics,participants,summary,extra,body,path) "
@@ -355,7 +607,12 @@ def cmd_index(args) -> int:
         if doctype != "route":
             head = " | ".join(x for x in (d["title"], d["topics"],
                                           d["summary"], d["extra"]) if x)
-            pending.append((uri, head, _chunks(body)))
+            pending.append((uri, head, []))
+        if doctype == "entry":
+            for cpath, chead in index_claims(con, fm, uri, mtime):
+                pending.append((cpath, chead, []))
+                seen.add(cpath)
+            claims_dirty = True
         refreshed += 1 if uri in known else 0
         added += 0 if uri in known else 1
     for path in walk_txt(root):
@@ -370,9 +627,10 @@ def cmd_index(args) -> int:
             continue
         title = path.stem.replace("-", " ")
         con.execute("DELETE FROM docs WHERE path = ?", (uri,))
+        # an attachment IS its text — it rides the weighted `extra` column
         con.execute(
             "INSERT INTO docs (id,title,topics,participants,summary,extra,body,path) "
-            "VALUES (?,?,?,?,?,?,?,?)", ("", title, "", "", "", "", text, uri))
+            "VALUES (?,?,?,?,?,?,?,?)", ("", title, "", "", "", text, "", uri))
         con.execute(
             "INSERT OR REPLACE INTO meta VALUES (?,?,?,?,?,?,?,?,?,?)",
             (uri, mtime, None, "attachment", None, title, None, None, "", ""))
@@ -396,11 +654,21 @@ def cmd_index(args) -> int:
                             (uri, kind, v.shape[0], v.tobytes()))
             con.execute("INSERT OR REPLACE INTO kv VALUES ('embed_model', ?)",
                         (EMBED_MODEL,))
-    gone = set(known) - seen
+    kept_claims = {r[0] for r in con.execute(
+        "SELECT c.path FROM claims c JOIN meta m ON m.id = c.episode WHERE m.path IN (" +
+        ",".join("?" * len(seen)) + ")", list(seen))} if seen else set()
+    gone = set(known) - seen - kept_claims
     for uri in gone:
         con.execute("DELETE FROM meta WHERE path = ?", (uri,))
         con.execute("DELETE FROM docs WHERE path = ?", (uri,))
         con.execute("DELETE FROM vectors WHERE path = ?", (uri,))
+        con.execute("DELETE FROM claims WHERE path = ?", (uri,))
+        claims_dirty = True
+    if claims_dirty:
+        derive_claims(con)
+        minted = register_subjects(root, con)
+        if minted and not args.quiet:
+            print("kb index: new subjects registered in _subjects.yaml: " + ", ".join(minted))
     con.commit()
     n = con.execute("SELECT count(*) FROM meta").fetchone()[0]
     if not args.quiet:
@@ -436,28 +704,35 @@ def fts_query(raw: str) -> str:
     return " OR ".join(terms)
 
 
+# Ranking constants — tuned 2026-09-16 on the _eval.yaml gold set (hybrid MRR
+# 0.55 -> 0.66). Re-tune with KB_INDEX_DB=<scratch> + `kb eval`, never by feel.
 # column weights: id, title, topics, participants, summary, extra, body, path
-BM25_WEIGHTS = "4.0, 8.0, 6.0, 3.0, 5.0, 4.0, 1.0, 0.0"
-
-RRF_K = 60
+BM25_WEIGHTS = "4.0, 10.0, 6.0, 3.0, 7.0, 3.0, 0.0, 0.0"
+RRF_K = 20       # small k: a doc both legs agree on beats a doc one leg loves
 CANDIDATES = 50  # per-leg depth feeding the fusion
+# Post-fusion prior by doctype: the theory layer restates episode vocabulary, so
+# without this a model/problem outranks the very episode that grounds it.
+DOCTYPE_PRIOR = {"model": 0.7, "problem": 0.3}
 
 
-def bm25_leg(con, raw_query: str, limit: int = CANDIDATES) -> list[tuple[str, float]]:
+def bm25_leg(con, raw_query: str, limit: int = CANDIDATES,
+             claims: bool = False) -> list[tuple[str, float]]:
     """[(path, bm25_score_negated_better_bigger)], best first."""
+    where = "" if claims else "AND docs.path NOT LIKE 'claim:%' "
     sql = (f"SELECT docs.path, bm25(docs, {BM25_WEIGHTS}) AS score "
-           f"FROM docs WHERE docs MATCH ? ORDER BY score LIMIT ?")
+           f"FROM docs WHERE docs MATCH ? {where}ORDER BY score LIMIT ?")
     return [(r[0], -r[1]) for r in con.execute(sql, (fts_query(raw_query), limit))]
 
 
-def vector_leg(root: Path, con, raw_query: str,
-               limit: int = CANDIDATES) -> list[tuple[str, float]]:
+def vector_leg(root: Path, con, raw_query: str, limit: int = CANDIDATES,
+               claims: bool = False) -> list[tuple[str, float]]:
     """[(path, cosine)], best first; doc score = max over its vectors, small
     head boost so distilled matches beat transcript-noise matches."""
     q = _embed(root, [raw_query])
     if q is None:
         return []
-    rows = con.execute("SELECT path, kind, vec FROM vectors").fetchall()
+    rows = con.execute("SELECT path, kind, vec FROM vectors" +
+                       ("" if claims else " WHERE path NOT LIKE 'claim:%'")).fetchall()
     if not rows:
         return []
     import numpy as np
@@ -480,7 +755,8 @@ def fuse_rrf(*legs: list[tuple[str, float]]) -> list[tuple[str, float]]:
     return sorted(scores.items(), key=lambda x: -x[1])
 
 
-def ranked_paths(root: Path, con, raw_query: str, mode: str) -> tuple[str, list, dict, dict]:
+def ranked_paths(root: Path, con, raw_query: str, mode: str,
+                 claims: bool = False) -> tuple[str, list, dict, dict]:
     """Resolve mode, run the legs, fuse. Returns (effective_mode,
     [(path, score)], bm_ranks, vec_ranks)."""
     has_vecs = con.execute("SELECT 1 FROM vectors LIMIT 1").fetchone()
@@ -489,24 +765,42 @@ def ranked_paths(root: Path, con, raw_query: str, mode: str) -> tuple[str, list,
     if mode == "vector" and not has_vecs:
         sys.exit("kb search: no vectors in the index — run `kb index` with network "
                  "access once (or unset KB_NO_EMBED)")
-    bm = bm25_leg(con, raw_query) if mode in ("lexical", "hybrid") else []
-    vec = vector_leg(root, con, raw_query) if mode in ("vector", "hybrid") else []
+    # Claims are a different retrieval surface: `kb facts` resolves them by key and
+    # auto-recall scores them on its own path. Letting them into the ranking legs
+    # costs episode recall (measured: hybrid MRR 0.687 -> 0.644) because ~350 short
+    # docs displace entries from the candidate window. Opt in with --claims.
+    bm = bm25_leg(con, raw_query, claims=claims) if mode in ("lexical", "hybrid") else []
+    vec = vector_leg(root, con, raw_query, claims=claims) if mode in ("vector", "hybrid") else []
     if mode == "hybrid" and not vec:
         mode = "lexical"  # encoder unavailable right now — degrade silently
     bm_ranks = {p: i + 1 for i, (p, _) in enumerate(bm)}
     vec_ranks = {p: i + 1 for i, (p, _) in enumerate(vec)}
     if mode == "lexical":
-        return mode, bm, bm_ranks, vec_ranks
-    if mode == "vector":
-        return mode, vec, bm_ranks, vec_ranks
-    return mode, fuse_rrf(bm, vec), bm_ranks, vec_ranks
+        fused = bm
+    elif mode == "vector":
+        fused = vec
+    else:
+        fused = fuse_rrf(bm, vec)
+    dt = {r[0]: r[1] for r in con.execute("SELECT path, doctype FROM meta")}
+    fused = sorted(((p, s * DOCTYPE_PRIOR.get(dt.get(p, ""), 1.0)) for p, s in fused),
+                   key=lambda x: -x[1])
+    return mode, fused, bm_ranks, vec_ranks
+
+
+def leaf_path(root: Path, con: sqlite3.Connection, uri: str) -> str:
+    """Filesystem path for a kb:/ URI, or the asserting episode's path for a claim."""
+    if uri.startswith("claim:"):
+        eid = uri.split(":")[1]
+        row = con.execute("SELECT path FROM meta WHERE id = ?", (eid,)).fetchone()
+        return str(from_kb_uri(root, row[0])) + f"  (claim {uri.rsplit(':', 1)[1]})" if row else uri
+    return str(from_kb_uri(root, uri))
 
 
 def cmd_search(args) -> int:
     root = kb_root()
     con = ensure_index(root)
     mode, cand, bm_ranks, vec_ranks = ranked_paths(
-        root, con, " ".join(args.query), args.mode)
+        root, con, " ".join(args.query), args.mode, claims=args.claims)
     if not cand:
         print("no hits")
         return 1
@@ -521,6 +815,8 @@ def cmd_search(args) -> int:
         params.append(args.type)
     elif not args.routes:
         sql += " AND m.doctype != 'route'"
+    if args.type != "claim" and not args.claims:
+        sql += " AND m.doctype != 'claim'"
     if not args.all_status:
         # active/draft are the live leaf+recipe statuses; hypothesis/corroborated the
         # live model ones; open/ready the live problem ones
@@ -538,7 +834,7 @@ def cmd_search(args) -> int:
         out = []
         for uri, score in hits:
             rid, doctype, status, title, created, topics, summary = meta[uri]
-            out.append({"id": rid, "path": str(from_kb_uri(root, uri)), "kb_path": uri,
+            out.append({"id": rid, "path": leaf_path(root, con, uri), "kb_path": uri,
                         "type": doctype, "status": status, "title": title,
                         "created": created, "topics": topics,
                         "score": round(score, 4), "mode": mode,
@@ -554,12 +850,688 @@ def cmd_search(args) -> int:
         label = doctype + ("" if status in (None, "active") else f", {status}")
         shown = f"{score:6.2f}" if mode != "hybrid" else f"{score:6.4f}"
         print(f"[{shown}] {rid or uri}  ({label})")
-        print(f"         file: {from_kb_uri(root, uri)}")
+        print(f"         file: {leaf_path(root, con, uri)}")
         print(f"         title: {title}" + (f"  ({created[:10]})" if created else ""))
         if topics:
             print(f"         topics: {topics}")
         if summary:
             print(f"         summary: {first_line(summary)}")
+    return 0
+
+
+# ---------------------------------------------------------------- transcript
+#
+# The transcript is the HOT-tier payload of an episode. Rendering it is
+# clerical work: user turns verbatim, assistant text verbatim, tool calls as
+# one-line stubs, tool results truncated, thinking and sidechains dropped.
+# Before this existed the LLM re-typed ~10 KB of transcript per filing.
+
+TOOL_RESULT_MAX = 300
+
+
+def _strip_meta_markup(text: str) -> str:
+    text = re.sub(r"<system-reminder>.*?</system-reminder>", "", text, flags=re.S)
+    text = re.sub(r"<local-command-stdout>.*?</local-command-stdout>", "", text, flags=re.S)
+    text = re.sub(r"<local-command-caveat>.*?</local-command-caveat>", "", text, flags=re.S)
+    m = re.search(r"<command-name>(.*?)</command-name>", text, flags=re.S)
+    if m:
+        args = re.search(r"<command-args>(.*?)</command-args>", text, flags=re.S)
+        cmd = m.group(1).strip()
+        cmd = cmd if cmd.startswith("/") else "/" + cmd
+        text = f"{cmd} {args.group(1).strip() if args else ''}".strip()
+    return text.strip()
+
+
+def _tool_stub(block: dict) -> str:
+    name = block.get("name") or "tool"
+    inp = block.get("input") or {}
+    for k in ("description", "command", "file_path", "pattern", "query", "url", "prompt"):
+        v = inp.get(k)
+        if isinstance(v, str) and v.strip():
+            v = " ".join(v.split())
+            return f"[tool: {name} — {v[:140]}{'…' if len(v) > 140 else ''}]"
+    return f"[tool: {name}]"
+
+
+def render_transcript(path: Path, owner: str = "User") -> tuple[dict, str]:
+    """(meta, markdown). Faithful to turn order; payloads condensed, never invented."""
+    meta = {"session_id": None, "cwd": None, "started": None, "ended": None, "user_turns": 0}
+    out: list[str] = []
+    for raw in path.read_text().splitlines():
+        try:
+            l = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        t = l.get("type")
+        if t not in ("user", "assistant") or l.get("isSidechain"):
+            continue
+        meta["session_id"] = meta["session_id"] or l.get("sessionId")
+        meta["cwd"] = meta["cwd"] or l.get("cwd")
+        if l.get("timestamp"):
+            meta["started"] = meta["started"] or l["timestamp"]
+            meta["ended"] = l["timestamp"]
+        content = (l.get("message") or {}).get("content")
+        if t == "user":
+            if isinstance(content, str):
+                text = _strip_meta_markup(content)
+                if text and not l.get("isMeta"):
+                    meta["user_turns"] += 1
+                    out.append(f"**{owner}:** {text}\n")
+                continue
+            texts: list[str] = []
+            for b in content or []:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "text":
+                    texts.append(b.get("text") or "")
+                elif b.get("type") == "tool_result":
+                    c = b.get("content")
+                    if isinstance(c, list):
+                        c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+                    c = " ".join(str(c or "").split())
+                    if c:
+                        out.append(f"> [result] {c[:TOOL_RESULT_MAX]}"
+                                   f"{'…' if len(c) > TOOL_RESULT_MAX else ''}\n")
+            text = _strip_meta_markup("\n".join(texts))
+            if text and not l.get("isMeta"):
+                meta["user_turns"] += 1
+                out.append(f"**{owner}:** {text}\n")
+        else:
+            parts: list[str] = []
+            for b in content or []:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "text" and (b.get("text") or "").strip():
+                    parts.append(b["text"].strip())
+                elif b.get("type") == "tool_use":
+                    parts.append(_tool_stub(b))
+            if parts:
+                out.append("**Claude:** " + "\n".join(parts) + "\n")
+    head = ("# Transcript (condensed by `kb transcript`: faithful to turn order, tool "
+            "payloads truncated, thinking omitted)\n\n"
+            f"session `{meta['session_id']}` · cwd `{meta['cwd']}` · "
+            f"{(meta['started'] or '')[:16]} → {(meta['ended'] or '')[:16]} · "
+            f"{meta['user_turns']} user turns\n\n")
+    return meta, head + "\n".join(out)
+
+
+def cmd_transcript(args) -> int:
+    p = Path(args.path).expanduser()
+    if not p.is_file():
+        sys.exit(f"kb transcript: no such file {p}")
+    meta, text = render_transcript(p, owner=args.owner)
+    print(text, end="")
+    print(f"\n<!-- kb transcript: {meta['user_turns']} user turns, {len(text)} chars -->")
+    return 0
+
+
+# ---------------------------------------------------------------------- file
+#
+# The deterministic leaf writer. Judgment (title, summary, topics, decisions,
+# placement) arrives as one small JSON payload from the LLM; everything else —
+# id, timestamps, key order, YAML quoting, transcript, folder bootstrap,
+# validation, route bookkeeping, index refresh, same-topic living-layer lookup
+# — happens here. A leaf that fails the schema is never written.
+
+LEAF_KEYS = ("id", "title", "created", "updated", "participants", "topics", "related",
+             "sources", "status", "supersedes", "superseded_by", "contradicts",
+             "recipe_candidate", "decisions", "open_questions", "claims", "summary")
+
+
+def slugify(text: str, limit: int = 64) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    slug = re.sub(r"^\d{4}-\d{2}-\d{2}-", "", slug)  # never double a date prefix
+    if len(slug) > limit:  # cut at a word boundary, never mid-word
+        slug = slug[:limit].rsplit("-", 1)[0] if "-" in slug[:limit] else slug[:limit]
+    return slug.strip("-") or "entry"
+
+
+def yblock(v: str, indent: int = 2) -> str:
+    """Literal block scalar for multi-line prose (summary)."""
+    pad = " " * indent
+    body = "\n".join(pad + line if line.strip() else "" for line in v.strip().splitlines())
+    return "|\n" + body
+
+
+def ylist(items: list, indent: int = 2) -> str:
+    if not items:
+        return "[]"
+    pad = " " * indent
+    return "\n" + "\n".join(f"{pad}- {ydump(str(i))}" for i in items)
+
+
+def emit_leaf(fm: dict, body: str) -> str:
+    lines = ["---"]
+    for k in LEAF_KEYS:
+        v = fm.get(k)
+        if k == "summary":
+            lines.append(f"summary: {yblock(v)}")
+        elif k == "topics":
+            lines.append(f"topics: {yflow(v or [])}")  # one line: audit-topics rewrites it
+        elif k in ("participants",):
+            lines.append(f"{k}: {yflow(v or [])}")
+        elif k in ("related", "sources", "supersedes", "contradicts", "decisions", "open_questions"):
+            lines.append(f"{k}:{ylist(v or [])}" if v else f"{k}: []")
+        elif k == "superseded_by":
+            lines.append("superseded_by: null" if v is None else f"superseded_by: {ydump(v)}")
+        elif k == "claims":
+            if not v:
+                lines.append("claims: []")
+            else:
+                lines.append("claims:")
+                for c in v:
+                    lines.append(f"  - subject: {c['subject']}")
+                    lines.append(f"    value: {ydump(c['value'])}")
+                    for ck in ("scope", "since", "kind", "source"):
+                        if c.get(ck) not in (None, "", {}):
+                            lines.append(f"    {ck}: {ydump(c[ck])}")
+        elif k == "recipe_candidate":
+            lines.append(f"recipe_candidate: {'true' if v else 'false'}")
+        else:
+            lines.append(f"{k}: {ydump(v)}")
+    lines.append("---")
+    return "\n".join(lines) + "\n\n" + body.rstrip() + "\n"
+
+
+def session_state_path(root: Path, cwd: str) -> Path:
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", cwd).strip("-")
+    return root / ".index" / "sessions" / f"{slug}.json"
+
+
+def resolve_session(root: Path, ref: str, cwd: str | None) -> Path:
+    if ref != "auto":
+        p = Path(ref).expanduser()
+        if not p.is_file():
+            sys.exit(f"kb file: transcript not found: {p}")
+        return p
+    cwd = cwd or os.getcwd()
+    st = session_state_path(root, cwd)
+    if not st.is_file():
+        sys.exit("kb file: no recorded session for this cwd (the UserPromptSubmit hook "
+                 "records it) — pass --session <path-to-jsonl> explicitly")
+    data = json.loads(st.read_text())
+    p = Path(data.get("transcript_path", ""))
+    if not p.is_file():
+        sys.exit(f"kb file: recorded transcript missing on disk: {p}")
+    return p
+
+
+def living_candidates(con: sqlite3.Connection, topics: list[str]) -> list[tuple]:
+    """Models/recipes sharing >=1 topic with a fresh entry — the bounded sweep
+    the filing procedure's living-layer check reads instead of the whole corpus."""
+    if not topics:
+        return []
+    sql = ("SELECT id, doctype, status, title, topics FROM meta WHERE doctype IN "
+           "('model','recipe') AND status NOT IN ('superseded','refuted') AND (" +
+           " OR ".join(["(',' || replace(topics, ' ', '') || ',') LIKE ?"] * len(topics)) +
+           ")")
+    want = {t.lower() for t in topics}
+    rows = []
+    for r in con.execute(sql, [f"%,{t},%" for t in topics]):
+        have = {t.strip().lower() for t in (r[4] or "").split(",")}
+        rows.append((len(want & have), r))
+    rows.sort(key=lambda x: (-x[0], x[1][1], x[1][0]))
+    # a single shared broad tag (e.g. the product name) is not a reason to read a
+    # model; prefer >=2 shared topics, fall back to the top few single-overlap ones
+    strong = [r for n, r in rows if n >= 2]
+    return strong or [r for _, r in rows[:4]]
+
+
+def validate_tree(root: Path) -> list[str]:
+    v = engine_dir() / "scripts" / "validate.py"
+    r = subprocess.run(["uv", "run", "--quiet", str(v), "--quiet"],
+                       capture_output=True, text=True,
+                       env={**os.environ, "KB_DATA_DIR": str(root)})
+    return [l for l in (r.stderr or "").splitlines() if l.startswith("kb:/")]
+
+
+def dequeue_capture(root: Path, transcript: Path) -> None:
+    q = root / ".librarian" / "capture-queue.tsv"
+    if q.is_file():
+        keep = [l for l in q.read_text().splitlines() if str(transcript) not in l]
+        q.write_text("\n".join(keep) + ("\n" if keep else ""))
+
+
+def cmd_file(args) -> int:
+    root = kb_root()
+    raw = sys.stdin.read() if args.meta == "-" else Path(args.meta).read_text()
+    try:
+        meta = json.loads(raw)
+    except json.JSONDecodeError as e:
+        sys.exit(f"kb file: --meta is not valid JSON: {e}")
+    missing = [k for k in ("title", "summary", "folder") if not meta.get(k)]
+    if missing:
+        sys.exit(f"kb file: payload missing {missing}")
+    if len(str(meta["summary"]).strip()) < 20:
+        sys.exit("kb file: summary too short — it is the WARM-tier payload")
+    if not args.jot and not args.session:
+        sys.exit("kb file: pass --session <jsonl>|auto (episode) or --jot (no transcript)")
+
+    folder_uri = str(meta["folder"]).rstrip("/")
+    if not folder_uri.startswith("kb:/"):
+        sys.exit(f"kb file: folder must be a kb:/ URI, got {folder_uri!r}")
+    folder = from_kb_uri(root, folder_uri)
+    created_folder = False
+    if not folder.is_dir():
+        purpose = str(meta.get("folder_purpose") or "").strip()
+        if len(purpose) < 15:
+            sys.exit(f"kb file: {folder_uri} does not exist — pass folder_purpose "
+                     f"(one good sentence; it is hand-curated forever) to create it")
+        if not (folder.parent / "_route.md").is_file():
+            sys.exit(f"kb file: parent {to_kb_uri(root, folder.parent)} has no _route.md — "
+                     f"create one level at a time")
+        created_folder = True
+
+    owner = (meta.get("participants") or ["user"])[0]
+    transcript_path = None
+    if args.jot:
+        body = str(meta.get("body") or meta["summary"]).strip()
+        tmeta = {}
+    else:
+        transcript_path = resolve_session(root, args.session, args.cwd)
+        tmeta, body = render_transcript(transcript_path, owner=str(owner).capitalize())
+        if tmeta["user_turns"] == 0:
+            sys.exit(f"kb file: {transcript_path} rendered to zero user turns — wrong file?")
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    slug = slugify(str(meta.get("slug") or meta["title"]))
+    con = open_db(root)
+    base_id, leaf_id, n = f"{today}-{slug}", f"{today}-{slug}", 2
+    while (folder / f"{leaf_id}.md").exists() or \
+            con.execute("SELECT 1 FROM meta WHERE id = ?", (leaf_id,)).fetchone():
+        leaf_id = f"{base_id}-{n}"
+        n += 1
+    now = now_iso()
+    related = [str(r) for r in (meta.get("related") or [])]
+    route_uri = f"{folder_uri}/_route.md"
+    if route_uri not in related:
+        related.insert(0, route_uri)
+    claims_in = []
+    for c in meta.get("claims") or []:
+        if not isinstance(c, dict):
+            continue
+        subj = str(c.get("subject") or "").strip().lower()
+        if not SUBJECT_RE.match(subj):
+            sys.exit(f"kb file: claim subject {subj!r} is not a dotted key like area.thing.attribute")
+        if not str(c.get("value") or "").strip():
+            sys.exit(f"kb file: claim on {subj} has no value")
+        if c.get("kind") and c["kind"] not in CLAIM_KINDS:
+            sys.exit(f"kb file: claim kind must be one of {CLAIM_KINDS}")
+        item = {"subject": subj, "value": str(c["value"]).strip()}
+        if isinstance(c.get("scope"), dict) and c["scope"]:
+            item["scope"] = c["scope"]
+        if c.get("since"):
+            item["since"] = str(c["since"])[:10]
+        if c.get("kind"):
+            item["kind"] = c["kind"]
+        if c.get("source"):
+            item["source"] = str(c["source"])
+        claims_in.append(item)
+    fm = {
+        "id": leaf_id, "title": str(meta["title"]).strip(), "created": now, "updated": now,
+        "participants": [str(x) for x in (meta.get("participants") or [owner])],
+        "topics": [str(t) for t in (meta.get("topics") or [])],
+        "related": related,
+        "sources": [str(u) for u in (meta.get("sources") or [])],
+        "status": "active", "supersedes": [], "superseded_by": None, "contradicts": [],
+        "recipe_candidate": bool(meta.get("recipe_candidate", False)),
+        "decisions": [str(d) for d in (meta.get("decisions") or [])],
+        "open_questions": [str(q) for q in (meta.get("open_questions") or [])],
+        "claims": claims_in,
+        "summary": str(meta["summary"]).strip(),
+    }
+    text = emit_leaf(fm, body)
+    leaf = folder / f"{leaf_id}.md"
+
+    if args.dry_run:
+        print(f"would write {to_kb_uri(root, leaf)}" +
+              (f" (creating {folder_uri})" if created_folder else ""))
+        print(text[: text.index("\n---\n", 4) + 5])
+        print(f"[body: {len(body)} chars" +
+              (f", {tmeta['user_turns']} user turns from {transcript_path}" if tmeta else "") + "]")
+        return 0
+
+    if created_folder:
+        folder.mkdir(parents=True)
+        title = folder.name.replace("-", " ").title()
+        (folder / "_route.md").write_text(
+            f"---\ntype: route\nfolder: {folder_uri}\ntitle: {ydump(title)}\n"
+            f"purpose: {ydump(purpose)}\nlast_indexed: {now}\ntopics: []\nsubroutes: []\n"
+            f"entries: []\nrelated: []\n---\n\n# {title}\n")
+    leaf.write_text(text)
+    cmd_reindex_routes(argparse.Namespace(dry_run=False, quiet=True))
+    errors = [e for e in validate_tree(root)
+              if leaf.name in e or (created_folder and folder_uri in e)]
+    if errors:
+        leaf.unlink()
+        if created_folder:
+            (folder / "_route.md").unlink()
+            folder.rmdir()
+        cmd_reindex_routes(argparse.Namespace(dry_run=False, quiet=True))
+        print("kb file: REFUSED — the leaf would violate the schema:", file=sys.stderr)
+        for e in errors:
+            print("  " + e, file=sys.stderr)
+        return 1
+    cmd_sync(argparse.Namespace(quiet=True))
+    if transcript_path:
+        dequeue_capture(root, transcript_path)
+
+    con = open_db(root)
+    print(f"FILED {leaf}")
+    print(f"  id: {leaf_id}" + (f"   (new folder {folder_uri})" if created_folder else ""))
+    print(f"  topics: {', '.join(fm['topics']) or '-'}")
+    if tmeta:
+        print(f"  transcript: {tmeta['user_turns']} user turns, {len(body)} chars, "
+              f"session {tmeta['session_id']}")
+    if claims_in:
+        vocab = load_subjects(root)
+        print(f"  claims: {len(claims_in)}")
+        for c in claims_in:
+            key = c["subject"] + (f" [{scope_key(c.get('scope'))}]" if c.get("scope") else "")
+            prior = con.execute(
+                "SELECT value, since, episode, valid_to FROM claims WHERE subject = ? AND scope = ? "
+                "AND episode != ? ORDER BY since DESC LIMIT 1",
+                (c["subject"], scope_key(c.get("scope")), leaf_id)).fetchone()
+            note = ""
+            if prior:
+                same = norm_value(prior[0]) == norm_value(c["value"])
+                note = (f"  ← confirms {prior[2]}" if same else
+                        f"  ← SUPERSEDES {prior[2]} ({prior[1]}: {first_line(prior[0], 70)!r})")
+            newsubj = "  (new subject — check `kb subjects --match` for an existing key first)" \
+                if c["subject"] not in vocab["subjects"] else ""
+            print(f"    {key} = {first_line(c['value'], 80)}{note}{newsubj}")
+    cands = living_candidates(con, fm["topics"])
+    if cands:
+        print("  same-topic living layer — check each against this entry "
+              "(refutes/corroborates a model? outdates a recipe step?):")
+        for cid, doctype, status, title, _ in cands:
+            print(f"    {cid}  ({doctype}, {status}) — {first_line(title, 90)}")
+    else:
+        print("  same-topic living layer: none — nothing to check")
+    return 0
+
+
+# --------------------------------------------------------------------- facts
+
+def current_claims(con: sqlite3.Connection, prefix: str | None = None,
+                   as_of: str | None = None, scope: dict[str, str] | None = None,
+                   include_superseded: bool = False) -> list[sqlite3.Row]:
+    con.row_factory = sqlite3.Row
+    sql = "SELECT * FROM claims WHERE 1=1"
+    params: list[object] = []
+    if prefix:
+        sql += " AND (subject = ? OR subject LIKE ?)"
+        params += [prefix, prefix + ".%"]
+    if as_of:
+        sql += " AND since <= ? AND (valid_to IS NULL OR valid_to > ?)"
+        params += [as_of, as_of]
+    elif not include_superseded:
+        sql += " AND valid_to IS NULL"
+    sql += " ORDER BY subject, scope, since, asserted"
+    rows = con.execute(sql, params).fetchall()
+    con.row_factory = None
+    if scope is not None:
+        rows = [r for r in rows if scope_matches(r["scope"], scope)]
+    return rows
+
+
+def resolve_scope(rows: list, scope: dict[str, str]) -> sqlite3.Row | None:
+    """Most specific applicable claim wins; the unscoped one is the default."""
+    applicable = [r for r in rows if scope_matches(r["scope"], scope)]
+    if not applicable:
+        return None
+    return max(applicable, key=lambda r: (len(parse_scope(r["scope"])), r["since"]))
+
+
+def cmd_facts(args) -> int:
+    root = kb_root()
+    con = ensure_index(root)
+    want = dict(kv.split("=", 1) for kv in (args.scope or []) if "=" in kv)
+    rows = current_claims(con, args.subject, as_of=args.as_of,
+                          include_superseded=args.history)
+    if not rows:
+        print("no claims" + (f" under {args.subject}" if args.subject else "") +
+              (f" as of {args.as_of}" if args.as_of else ""))
+        return 1
+    vocab = load_subjects(root)
+    by_subject: dict[str, list] = {}
+    for r in rows:
+        by_subject.setdefault(r["subject"], []).append(r)
+    if args.json:
+        out = []
+        for subj, rs in by_subject.items():
+            pick = resolve_scope([r for r in rs if r["valid_to"] is None or args.as_of], want) if want else None
+            out.append({"subject": subj, "resolved": dict(pick) if pick else None,
+                        "claims": [dict(r) for r in rs]})
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        return 0
+    now = datetime.now(timezone.utc).date()
+    for subj, rs in by_subject.items():
+        print(subj)
+        live = [r for r in rs if r["valid_to"] is None or args.as_of]
+        if want:
+            pick = resolve_scope(live, want)
+            if pick:
+                print(f"  → for {';'.join(f'{k}={v}' for k, v in want.items())}: {pick['value']}"
+                      f"  (since {pick['since']}, {pick['kind']}, {pick['episode']})")
+        for r in rs:
+            tag = "  " if (r["valid_to"] is None or args.as_of) else "  ✗"
+            scope = f"[{r['scope']}] " if r["scope"] else ""
+            line = f"{tag} {scope}{r['value']}"
+            meta = [f"since {r['since']}", r["kind"]]
+            if r["confirmed"]:
+                meta.append(f"confirmed {r['confirmed']}")
+            if r["valid_to"]:
+                meta.append(f"until {r['valid_to']} → {r['superseded_by'].split(':')[1]}")
+            else:
+                half = subject_decay_days(vocab, subj)
+                ref = r["confirmed"] or r["since"]
+                if half:
+                    try:
+                        age = (now - datetime.strptime(ref, "%Y-%m-%d").date()).days
+                        if age > half:
+                            meta.append(f"STALE? {age}d unconfirmed (decay {half}d)")
+                    except ValueError:
+                        pass
+            print(f"{line}\n       {' · '.join(meta)} · {r['episode']}" +
+                  (f"\n       {r['source']}" if r["source"] else ""))
+    return 0
+
+
+def rename_subject(root: Path, old: str, new: str) -> int:
+    """Vocabulary curation: rewrite `subject: old` -> `subject: new` in every
+    episode's claims, merge the _subjects.yaml entries (aliases union, old key
+    kept as an alias), then reindex. Returns the number of claims moved."""
+    if not SUBJECT_RE.match(new):
+        sys.exit(f"kb subjects --rename: {new!r} is not a valid dotted subject")
+    moved = 0
+    pat = re.compile(rf"^(\s*-?\s*subject:\s*){re.escape(old)}\s*$", re.M)
+    for p in walk_md(root):
+        fm, _ = parse_fm(p)
+        if not fm or not fm.get("claims"):
+            continue
+        text = p.read_text()
+        new_text, n = pat.subn(rf"\g<1>{new}", text)
+        if n:
+            p.write_text(new_text)
+            moved += n
+    vp = root / "_subjects.yaml"
+    if vp.is_file():
+        text = vp.read_text()
+        data = yaml.load(text, Loader=StrLoader) or {}
+        subs = data.get("subjects") or {}
+        o = subs.pop(old, None) or {}
+        t = subs.get(new) or {}
+        aliases = list(dict.fromkeys([*(t.get("aliases") or []), *(o.get("aliases") or []),
+                                      old.replace(".", " ").replace("-", " ")]))
+        subs[new] = {**o, **t, "aliases": aliases}
+        # Rewrite ONLY the `subjects:` mapping; everything above it (the header
+        # comment, decay classes, defaults) is hand-curated and stays byte-identical.
+        m = re.search(r"^subjects:\s*$", text, re.M)
+        if not m:
+            sys.exit("kb subjects --rename: _subjects.yaml has no `subjects:` key")
+        body = yaml.safe_dump({"subjects": dict(sorted(subs.items()))}, sort_keys=False,
+                              allow_unicode=True, width=100)
+        vp.write_text(text[: m.start()] + body)
+    return moved
+
+
+def cmd_subjects(args) -> int:
+    root = kb_root()
+    if args.rename:
+        old, new = args.rename
+        moved = rename_subject(root, old, new)
+        cmd_index(argparse.Namespace(rebuild=False, quiet=True))
+        print(f"kb subjects: {old} -> {new}: {moved} claim(s) moved; old key kept as an alias")
+        return 0
+    con = ensure_index(root)
+    vocab = load_subjects(root)
+    counts = {r[0]: (r[1], r[2]) for r in con.execute(
+        "SELECT subject, count(*), sum(valid_to IS NULL) FROM claims GROUP BY subject")}
+    subjects = sorted(set(vocab["subjects"]) | set(counts))
+    if args.dups:
+        # Curation aid. Two subjects are merge candidates only when they name the
+        # same ATTRIBUTE of the same THING — same thing under different areas, or
+        # thing names that are suffix variants of each other (vmf vs vmf-library).
+        # Sharing a word is not enough: `.location` on two different things is
+        # correct design, and a list of those is noise, not a work queue.
+        import itertools
+
+        def split3(x: str) -> tuple[str, str, str]:
+            p = x.split(".")
+            return p[0], ".".join(p[1:-1]), p[-1]
+
+        pairs = []
+        for a, b in itertools.combinations(subjects, 2):
+            aa, at, an = split3(a)
+            ba, bt, bn = split3(b)
+            if an != bn or not at or not bt:
+                continue
+            if at == bt and aa != ba:
+                pairs.append((a, b, "same thing + attribute, different area"))
+            elif aa == ba and (at.startswith(bt + "-") or bt.startswith(at + "-")):
+                pairs.append((a, b, "thing name is a suffix variant"))
+        if not pairs:
+            print("no merge candidates — every subject names a distinct thing+attribute")
+            return 0
+        for a, b, why in pairs:
+            print(f"{why}:")
+            for x in (a, b):
+                row = con.execute("SELECT value FROM claims WHERE subject = ? "
+                                  "ORDER BY since DESC LIMIT 1", (x,)).fetchone()
+                print(f"    {x}  ({counts.get(x, (0, 0))[1]} current)")
+                if row:
+                    print(f"        {first_line(row[0], 100)}")
+        print(f"\n{len(pairs)} candidate pair(s) — merge with "
+              f"`kb subjects --rename <old> <new>` when they are the same fact")
+        return 0
+    if args.match:
+        words = {w for w in re.findall(r"[a-z0-9]+", args.match.lower()) if len(w) >= 3}
+        def hit(subj: str) -> bool:
+            entry = vocab["subjects"].get(subj) or {}
+            hay = subj.replace(".", " ").replace("-", " ") + " " + " ".join(
+                str(a) for a in (entry.get("aliases") or []) if isinstance(entry, dict))
+            return bool(words & set(re.findall(r"[a-z0-9]+", hay.lower())))
+        subjects = [x for x in subjects if hit(x)]
+    if not subjects:
+        print("no subjects" + (f" matching {args.match!r}" if args.match else ""))
+        return 1
+    if args.json:
+        print(json.dumps([{"subject": x, "claims": counts.get(x, (0, 0))[0],
+                           "current": counts.get(x, (0, 0))[1],
+                           **(vocab["subjects"].get(x) or {})} for x in subjects],
+                         indent=2, ensure_ascii=False))
+        return 0
+    for x in subjects:
+        n, cur = counts.get(x, (0, 0))
+        entry = vocab["subjects"].get(x) or {}
+        aliases = ", ".join(str(a) for a in (entry.get("aliases") or [])) if isinstance(entry, dict) else ""
+        decay = subject_decay_days(vocab, x)
+        print(f"{x}  ({cur} current / {n} total; decay {decay or 'never'})" +
+              (f"\n    aliases: {aliases}" if aliases else ""))
+    return 0
+
+
+# --------------------------------------------------------------------- check
+#
+# "Things are not as they appear": given any text — a bot's answer, a tool
+# result, a draft reply — find the subjects it touches and serve the KB's
+# current claims on them, so the LLM can spot where the text and the KB
+# disagree. Matching is deterministic (aliases, key words, BM25 over claim
+# docs); judging is the LLM's job. Silence when nothing matches.
+
+CHECK_MAX_SUBJECTS = 8
+
+
+def subject_matchers(vocab: dict) -> dict[str, tuple[list[str], set[str]]]:
+    """subject -> (alias phrases, key words after the area segment)."""
+    out = {}
+    for subj, entry in (vocab.get("subjects") or {}).items():
+        aliases = [str(a).lower() for a in ((entry or {}).get("aliases") or [])] \
+            if isinstance(entry, dict) else []
+        words = {w for seg in subj.split(".")[1:] for w in seg.split("-") if len(w) >= 3}
+        out[subj] = (aliases, words)
+    return out
+
+
+def check_candidates(root: Path, con: sqlite3.Connection, text: str) -> list[tuple[str, str]]:
+    """[(subject, why)] ranked; alias/keyword hits first, then BM25 over claim docs."""
+    low = " " + re.sub(r"\s+", " ", text.lower()) + " "
+    words = set(re.findall(r"[a-z0-9]+", low))
+    vocab = load_subjects(root)
+    used = {r[0] for r in con.execute("SELECT DISTINCT subject FROM claims WHERE valid_to IS NULL")}
+    scored: dict[str, tuple[int, str]] = {}
+    for subj, (aliases, keys) in subject_matchers(vocab).items():
+        if subj not in used:
+            continue
+        hit_alias = next((a for a in aliases if a and f" {a} " in low), None)
+        overlap = keys & words
+        if hit_alias:
+            scored[subj] = (100 + len(overlap), f"mentions '{hit_alias}'")
+        elif len(overlap) >= 2 or (len(keys) == 1 and overlap):
+            scored[subj] = (10 * len(overlap), "words " + ", ".join(sorted(overlap)))
+    toks = [t for t in re.findall(r"[A-Za-z0-9_-]{3,}", text.lower())
+            if t not in RECALL_STOP][:32]
+    if len(toks) >= 2:
+        sql = (f"SELECT c.subject, bm25(docs, {BM25_WEIGHTS}) AS score FROM docs "
+               f"JOIN claims c ON c.path = docs.path WHERE docs MATCH ? AND c.valid_to IS NULL "
+               f"ORDER BY score LIMIT 12")
+        for subj, score in con.execute(sql, (fts_query(" ".join(toks)),)):
+            if -score >= RECALL_BM25_MIN and subj not in scored:
+                scored[subj] = (int(-score), f"lexical match bm25={-score:.1f}")
+    ranked = sorted(scored.items(), key=lambda x: -x[1][0])[:CHECK_MAX_SUBJECTS]
+    return [(subj, why) for subj, (_, why) in ranked]
+
+
+def cmd_check(args) -> int:
+    root = kb_root()
+    con = ensure_index(root)
+    text = sys.stdin.read()
+    if len(text.strip()) < 20:
+        return 1
+    cands = check_candidates(root, con, text)
+    if not cands:
+        return 1
+    if args.json:
+        out = []
+        for subj, why in cands:
+            rows = current_claims(con, subj)
+            out.append({"subject": subj, "why": why,
+                        "claims": [dict(r) for r in rows if r["subject"] == subj]})
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        return 0
+    print("KB claims on subjects this text touches — compare each with what the text asserts; "
+          "a disagreement is either the text being wrong (cite since + source) or the KB being "
+          "stale (then file the correction):")
+    for subj, why in cands:
+        rows = [r for r in current_claims(con, subj) if r["subject"] == subj]
+        print(f"\n{subj}   ({why})")
+        for r in rows:
+            scope = f"[{r['scope']}] " if r["scope"] else ""
+            print(f"  {scope}{r['value']}")
+            print(f"      since {r['since']} · {r['kind']}" +
+                  (f" · confirmed {r['confirmed']}" if r["confirmed"] else "") +
+                  f" · {r['episode']}" + (f" · {r['source']}" if r["source"] else ""))
     return 0
 
 
@@ -585,9 +1557,14 @@ def cmd_eval(args) -> int:
         # auto-recall calibration: fire on KB-relevant prompts, stay silent on
         # the no-hit set. This is the registration gate for the recall hook.
         nohit = [c for c in cases if not c.get("expect")]
-        hit = sum(1 for c in scored
-                  if any(r["id"] in c["expect"]
-                         for r in recall_candidates(root, con, str(c["q"]))))
+        def fires_correctly(case) -> bool:
+            for r in recall_candidates(root, con, str(case["q"])):
+                # a claim hit is correct when the episode backing it is expected
+                if r["id"] in case["expect"] or (set(r.get("episodes") or []) & set(case["expect"])):
+                    return True
+            return False
+
+        hit = sum(1 for c in scored if fires_correctly(c))
         fires = sum(1 for c in nohit
                     if recall_candidates(root, con, str(c["q"])))
         print(f"kb eval --recall: hit-rate {hit}/{len(scored)} "
@@ -608,7 +1585,14 @@ def cmd_eval(args) -> int:
         mrr = r1 = r5 = 0.0
         for c in scored:
             _, cand, _, _ = ranked_paths(root, con, str(c["q"]), mode)
-            ids = [id_of[p] for p, _ in cand if p in id_of][:10]
+            ids = []
+            for p, _ in cand:
+                x = id_of.get(p)
+                if x and "#" in x:
+                    x = x.split("#")[0]  # a claim hit counts for its episode
+                if x and x not in ids:
+                    ids.append(x)
+            ids = ids[:10]
             rank = next((i + 1 for i, x in enumerate(ids) if x in c["expect"]), None)
             if rank:
                 mrr += 1.0 / rank
@@ -737,21 +1721,6 @@ def recipe_trigger_lines(root: Path) -> list[str]:
     return out
 
 
-def model_statement_lines(root: Path) -> list[str]:
-    """One statement line per live model — the ambient premises for deduction."""
-    out: list[str] = []
-    mdl_dir = root / "models"
-    if mdl_dir.is_dir():
-        for p in sorted(mdl_dir.glob("*.md")):
-            if p.name == "_route.md":
-                continue
-            fm, _ = parse_fm(p)
-            if fm and fm.get("type") == "model" and fm.get("status") != "superseded":
-                tag = f" [{fm.get('status')}]"
-                out.append(f"  {fm.get('id')}{tag}: {first_line(fm.get('statement'), 150)}")
-    return out
-
-
 def cmd_routes(args) -> int:
     root = kb_root()
     routes = [p for p in walk_md(root) if p.name == "_route.md"]
@@ -777,12 +1746,6 @@ def cmd_routes(args) -> int:
         if rec:
             out.append("recipe triggers (when_to_use):")
             out.extend(rec)
-        # models get their statement line — the ambient premises for deduction
-        stmts = model_statement_lines(root)
-        if stmts:
-            out.append("")
-            out.append("model statements (deductive premises — combine to derive; cite ids):")
-            out.extend(stmts)
         text = "\n".join(out)
         print(text)
         chars = len(text)
@@ -869,6 +1832,7 @@ def emit_route(fm: dict, body: str) -> str:
 
 def cmd_reindex_routes(args) -> int:
     root = kb_root()
+    quiet = getattr(args, "quiet", False)
     now = now_iso()
     changed = 0
     for rp in [p for p in walk_md(root) if p.name == "_route.md"]:
@@ -952,7 +1916,8 @@ def cmd_reindex_routes(args) -> int:
             else:
                 rp.write_text(out)
     verb = "would rewrite" if args.dry_run else "rewrote"
-    print(f"kb reindex-routes: {verb} {changed} route file(s)")
+    if not quiet:
+        print(f"kb reindex-routes: {verb} {changed} route file(s)")
     return 0
 
 
@@ -1094,6 +2059,51 @@ def cmd_doctor(args) -> int:
             report("problem",
                    f"{pair[0]} vs {pair[1]} — live rivals; a crucial experiment "
                    f"should kill one (/criticize proposes it)")
+    # claim layer: conflicts (same key, same day, different value), weak
+    # supersession (a reported/inferred claim overriding an observed one), and
+    # staleness by the subject's decay class
+    vocab = load_subjects(root)
+    today = datetime.now(timezone.utc).date()
+    con.row_factory = sqlite3.Row
+    allc = con.execute("SELECT * FROM claims ORDER BY subject, scope, since, asserted").fetchall()
+    con.row_factory = None
+    by_key: dict[tuple, list] = {}
+    for r in allc:
+        by_key.setdefault((r["subject"], r["scope"]), []).append(r)
+    for (subj, scope), chain in by_key.items():
+        key = subj + (f" [{scope}]" if scope else "")
+        for a, b in zip(chain, chain[1:]):
+            if (a["since"] == b["since"] and a["value_norm"] != b["value_norm"]
+                    and not is_restatement(a["value_norm"], b["value_norm"])):
+                report("conflict", f"{key}: {a['episode']} says {a['value']!r} but "
+                                   f"{b['episode']} says {b['value']!r} on the same date — "
+                                   f"one is wrong or the scope is missing")
+        for r in chain:
+            if r["superseded_by"] and r["value_norm"] != next(
+                    (x["value_norm"] for x in chain if x["path"] == r["superseded_by"]), r["value_norm"]):
+                nxt = next((x for x in chain if x["path"] == r["superseded_by"]), None)
+                if nxt and r["kind"] == "observed" and nxt["kind"] != "observed":
+                    report("weak-superseded",
+                           f"{key}: observed {first_line(r['value'], 60)!r} ({r['episode']}) "
+                           f"overridden by {nxt['kind']} {first_line(nxt['value'], 60)!r} "
+                           f"({nxt['episode']}) — verify, or split the subject if these are "
+                           f"different facts")
+        cur = [r for r in chain if r["valid_to"] is None]
+        for r in cur:
+            half = subject_decay_days(vocab, subj)
+            if not half:
+                continue
+            ref = r["confirmed"] or r["since"]
+            try:
+                age = (today - datetime.strptime(ref, "%Y-%m-%d").date()).days
+            except ValueError:
+                continue
+            if age > half:
+                report("stale-claim", f"{key} = {first_line(r['value'], 55)!r} unconfirmed for "
+                                      f"{age}d (decay {half}d) — re-verify or supersede")
+    for subj in sorted({r["subject"] for r in allc}):
+        if subj not in vocab["subjects"]:
+            report("unknown-subject", f"{subj} used by a claim but not in _subjects.yaml — run `kb sync`")
     # route drift: leaf on disk newer than its route's last_indexed
     for rp in [p for p in walk_md(root) if p.name == "_route.md"]:
         fm, _ = parse_fm(rp)
@@ -1287,13 +2297,14 @@ def problems_brief_text(root: Path, probs=None) -> str:
            f"{len(ready)} ready to run · oldest {oldest}d · "
            f"{resolved_30d} resolved in last 30d"]
     for _, fm in sorted(ready, key=lambda x: age_days(x[1].get("created")),
-                        reverse=True):
+                        reverse=True)[:3]:
         exp = fm.get("experiment") or {}
         out.append(f"  READY {fm.get('id')} ({age_days(fm.get('created'))}d, "
-                   f"{exp.get('decisiveness', '?')}/{first_line(exp.get('cost'), 40)}): "
-                   f"{first_line(exp.get('observation'), 140)}")
+                   f"{exp.get('decisiveness', '?')}): "
+                   f"{first_line(exp.get('observation'), 100)}")
     if ready:
-        out.append("  Run one now: /run-experiment <id>")
+        out.append(f"  Run one now: /run-experiment <id>"
+                   + (f" ({len(ready) - 3} more: kb problems list --status ready)" if len(ready) > 3 else ""))
     else:
         out.append("  No experiments designed yet — /criticize turns open problems "
                    "into ready ones.")
@@ -1419,9 +2430,12 @@ def cmd_problems(args) -> int:
 # ------------------------------------------------------------------- ambient
 #
 # The SessionStart payload, tiered so global cost is O(folders), not O(entries):
-#   Tier A (always): folder map + recipe triggers + model statements.
+#   Tier A (always): folder map + recipe triggers. (Model statements were
+#     dropped 2026-09-16: 9 KB per session, cited in 8 of 134 sessions — models
+#     are reached through search/recall like every other leaf.)
 #   Tier B (cwd-relevant): per-entry lines ONLY for folders matching the repo
-#     the session opened in (exact-token match — fails closed).
+#     the session opened in (exact-token match — fails closed), newest
+#     TIER_B_MAX entries per folder.
 #   Tier C (deltas): problems brief, fresh nightly digest, unfiled-session queue.
 # The full per-entry map stays one call away: `kb routes --compact`.
 
@@ -1455,6 +2469,10 @@ def capture_queue_lines(root: Path, limit: int = 5) -> list[str]:
             for i, r in enumerate(rows)]
 
 
+TIER_B_MAX = 12      # newest entries shown per matched folder
+TIER_B_FOLDERS = 4   # matched folders shown (name matches rank above topic matches)
+
+
 def cmd_ambient(args) -> int:
     root = kb_root()
     out: list[str] = []
@@ -1468,7 +2486,7 @@ def cmd_ambient(args) -> int:
             continue
         folder = fm.get("folder", to_kb_uri(root, rp.parent))
         ents = [e for e in (fm.get("entries") or []) if isinstance(e, dict)]
-        out.append(f"  {folder} ({len(ents)}) — {first_line(fm.get('purpose'), 140)}")
+        out.append(f"  {folder} ({len(ents)}) — {first_line(fm.get('purpose'), 100)}")
         entry_map[folder] = [f"    {e.get('id')} — {first_line(e.get('summary'), 110)}"
                              for e in ents]
         route_meta.append((folder, [str(t).lower() for t in (fm.get("topics") or [])], fm))
@@ -1476,22 +2494,26 @@ def cmd_ambient(args) -> int:
     rec = recipe_trigger_lines(root)
     if rec:
         out += ["", "recipe triggers (when_to_use):", *rec]
-    stmts = model_statement_lines(root)
-    if stmts:
-        out += ["", "model statements (deductive premises — combine to derive; cite ids):", *stmts]
 
     if args.cwd:
         toks = _cwd_tokens(args.cwd)
         # models/recipes/problems are already ambient via their Tier-A blocks
-        matched = [f for f, topics, _ in route_meta
-                   if f.split("/")[-1].lower() not in ("models", "recipes", "problems")
-                   and (f.split("/")[-1].lower() in toks or toks & set(topics))]
-        shown = [f for f in matched if entry_map.get(f)]
+        # folder-name matches first (the repo's own folder), topic matches after;
+        # capped so a common topic tag cannot drag in a dozen folders
+        by_name = [f for f, topics, _ in route_meta
+                   if f.split("/")[-1].lower() in toks and entry_map.get(f)]
+        by_topic = [f for f, topics, _ in route_meta
+                    if f not in by_name and toks & set(topics) and entry_map.get(f)
+                    and f.split("/")[-1].lower() not in ("models", "recipes", "problems")]
+        shown = (by_name + by_topic)[:TIER_B_FOLDERS]
         if shown:
-            out += ["", f"RELEVANT TO THIS REPO ({Path(args.cwd).name}) — full entry lists:"]
+            out += ["", f"RELEVANT TO THIS REPO ({Path(args.cwd).name}) — newest entries:"]
             for f in shown:
+                lines = sorted(entry_map[f], reverse=True)  # ids are date-prefixed
                 out.append(f"  {f}:")
-                out += entry_map[f]
+                out += lines[:TIER_B_MAX]
+                if len(lines) > TIER_B_MAX:
+                    out.append(f"    … {len(lines) - TIER_B_MAX} older — `kb routes --compact`")
 
     brief = problems_brief_text(root)
     if brief:
@@ -1506,7 +2528,7 @@ def cmd_ambient(args) -> int:
             lines = digest.read_text().splitlines()
             cut = next((i for i, l in enumerate(lines)
                         if l.startswith("OPEN PROBLEMS")), len(lines))
-            slim = [l for l in lines[:cut] if l.strip()][:25]
+            slim = [l for l in lines[:cut] if l.strip()][:12]
             out += ["", "LIBRARIAN DIGEST (overnight run):", *slim]
 
     unfiled = capture_queue_lines(root)
@@ -1549,11 +2571,15 @@ RECALL_COS_MIN = 0.40
 RECALL_COS_WEAK = 0.35
 RECALL_BM25_MIN = 8.0
 RECALL_BM25_STRONG = 14.0
+# A lexical-only hit still needs minimal semantic agreement: BM25 scores move with
+# corpus statistics (adding the claim layer shifted them), and a hit at cos 0.09 is
+# unrelated by any measure. This floor is what keeps the always-on hook silent.
+RECALL_COS_FLOOR = 0.15
 
 
 def recall_candidates(root: Path, con, text: str, n: int = 3) -> list[dict]:
     text = re.sub(r"```.*?```", " ", text, flags=re.S)  # code blocks are noise
-    live_leaf = ("AND m.doctype IN ('entry','recipe','model','problem') "
+    live_leaf = ("AND m.doctype IN ('entry','recipe','model','problem','claim') "
                  "AND (m.status IN ('active','draft','hypothesis','corroborated',"
                  "'open','ready') OR m.status IS NULL)")
     cos: dict[str, float] = {}
@@ -1577,24 +2603,46 @@ def recall_candidates(root: Path, con, text: str, n: int = 3) -> list[dict]:
         bm = {path: -score for path, score
               in con.execute(sql, (fts_query(" ".join(toks)),))}
     hits: dict[str, dict] = {}
+    floor = float(os.environ.get("KB_EXP_RECALL_FLOOR", RECALL_COS_FLOOR))
     for path in set(cos) | set(bm):
         c, b = cos.get(path, 0.0), bm.get(path, 0.0)
         if (c >= RECALL_COS_MIN
-                or b >= RECALL_BM25_STRONG
+                or (b >= RECALL_BM25_STRONG and c >= floor)
                 or (b >= RECALL_BM25_MIN and c >= RECALL_COS_WEAK)):
             hits[path] = {"cos": c or None, "bm25": b or None}
+    # a current claim outranks the episodes around it: it IS the answer, one line
     ranked = sorted(hits.items(),
-                    key=lambda x: (-(x[1]["cos"] or 0), -(x[1]["bm25"] or 0)))[:n]
+                    key=lambda x: (0 if x[0].startswith("claim:") else 1,
+                                   -(x[1]["cos"] or 0), -(x[1]["bm25"] or 0)))[:n]
     out = []
+    shown_subjects: set[str] = set()
     for path, comp in ranked:
         row = con.execute(
             "SELECT m.id, m.doctype, m.title, "
             "(SELECT summary FROM docs WHERE docs.path = m.path) "
             "FROM meta m WHERE m.path = ?", (path,)).fetchone()
-        if row:
-            out.append({"id": row[0], "type": row[1], "title": row[2],
-                        "summary": first_line(row[3]), "path": str(from_kb_uri(root, path)),
-                        **comp})
+        if not row:
+            continue
+        item = {"id": row[0], "type": row[1], "title": row[2],
+                "summary": first_line(row[3]), "path": leaf_path(root, con, path), **comp}
+        if path.startswith("claim:"):
+            # serve the whole subject (default + exceptions), once, not one claim
+            subj = con.execute("SELECT subject FROM claims WHERE path = ?", (path,)).fetchone()
+            if not subj or subj[0] in shown_subjects:
+                continue
+            shown_subjects.add(subj[0])
+            cur = con.execute(
+                "SELECT scope, value, since, kind, episode, source FROM claims WHERE subject = ? "
+                "AND valid_to IS NULL ORDER BY length(scope), since", (subj[0],)).fetchall()
+            lines = []
+            for scope, value, since, kind, episode, source in cur:
+                lines.append((f"[{scope}] " if scope else "") + f"{value}  (since {since}, {kind}" +
+                             (f", {source}" if source else "") + f"; {episode})")
+            item["id"] = subj[0]
+            item["episodes"] = sorted({r[4] for r in cur})  # what a citation points at
+            item["title"] = f"current facts on {subj[0]} — `kb facts {subj[0]}` for history"
+            item["summary"] = " | ".join(lines)
+        out.append(item)
     return out
 
 
@@ -1655,14 +2703,49 @@ def main() -> int:
     p.add_argument("-n", type=int, default=10, help="max hits (default 10)")
     p.add_argument("--mode", choices=["hybrid", "lexical", "vector"], default="hybrid",
                    help="hybrid falls back to lexical when no vectors exist")
-    p.add_argument("--type", choices=["entry", "recipe", "model", "problem", "route", "all"], default="all")
+    p.add_argument("--type", choices=["entry", "recipe", "model", "problem", "claim", "route", "all"], default="all")
     p.add_argument("--topic", action="append", help="require a topic tag (repeatable)")
     p.add_argument("--person", action="append", help="require a participant (repeatable)")
     p.add_argument("--all-status", action="store_true",
                    help="include superseded/archived")
     p.add_argument("--routes", action="store_true", help="include _route.md hits")
+    p.add_argument("--claims", action="store_true", help="include individual claims as hits (default: episodes only; `kb facts` is the claim view)")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_search)
+
+    p = sub.add_parser("file", help="write a leaf from an LLM-distilled JSON payload (deterministic writer)")
+    p.add_argument("--meta", required=True, help="JSON payload path, or - for stdin")
+    p.add_argument("--session", help="session JSONL path, or 'auto' (recorded by the prompt hook for --cwd)")
+    p.add_argument("--cwd", help="session cwd for --session auto (default: current dir)")
+    p.add_argument("--jot", action="store_true", help="no transcript: body = payload.body or summary")
+    p.add_argument("--dry-run", action="store_true", help="print the frontmatter, write nothing")
+    p.set_defaults(fn=cmd_file)
+
+    p = sub.add_parser("facts", help="the claim layer: current value per (subject, scope), history, as-of")
+    p.add_argument("subject", nargs="?", help="subject or prefix (e.g. mt.nn-retrieval)")
+    p.add_argument("--scope", action="append", help="k=v to resolve (repeatable): most specific wins")
+    p.add_argument("--as-of", help="YYYY-MM-DD: what was true then")
+    p.add_argument("--history", action="store_true", help="include superseded claims")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_facts)
+
+    p = sub.add_parser("check", help="(text on stdin) current KB claims on every subject the text touches")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_check)
+
+    p = sub.add_parser("subjects", help="the subject vocabulary with claim counts")
+    p.add_argument("--match", help="words to match against subjects and aliases")
+    p.add_argument("--rename", nargs=2, metavar=("OLD", "NEW"),
+                   help="merge subject OLD into NEW across all claims (curation)")
+    p.add_argument("--dups", action="store_true",
+                   help="group subjects sharing a segment word — likely near-duplicates to --rename")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_subjects)
+
+    p = sub.add_parser("transcript", help="render a session JSONL as a condensed transcript")
+    p.add_argument("path")
+    p.add_argument("--owner", default="User", help="label for the human turns")
+    p.set_defaults(fn=cmd_transcript)
 
     p = sub.add_parser("eval", help="retrieval quality over the _eval.yaml gold set")
     p.add_argument("--mode", choices=["all", "hybrid", "lexical", "vector"], default="all")

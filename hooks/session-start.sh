@@ -2,7 +2,7 @@
 # session-start.sh — Claude Code SessionStart hook for Gregor's KB.
 #
 # Injects the tiered ambient payload (`kb ambient`) into every new session:
-#   Tier A (always, ~2-3k tokens): folder map + recipe triggers + model statements
+#   Tier A (always, ~2k tokens): folder map + recipe triggers
 #   Tier B (cwd-relevant): full entry lists for KB folders matching this repo
 #   Tier C (deltas): problems brief, fresh nightly digest, unfiled-session queue
 # The per-entry map for everything else stays one call away (kb routes --compact).
@@ -52,7 +52,7 @@ index = os.environ["INDEX"]
 engine = os.environ["KB_ENGINE_DIR"]
 context = f"""<kb-ambient-index>
 This is the ambient map of Gregor's personal knowledge base (auto-injected at session start).
-It is the FOLDER-level map plus recipe triggers and model statements — NOT the full entry list.
+It is the FOLDER-level map plus recipe triggers — NOT the full entry list.
 Use it to notice when prior context exists. To act on it:
 - `{engine}/scripts/kb search <terms>` — hybrid ranked search (or the /find command)
 - `{engine}/scripts/kb routes --compact` — the full one-line-per-entry map

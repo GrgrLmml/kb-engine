@@ -7,28 +7,34 @@ You are capturing a **jot** — a small, durable fact — into Gregor's knowledg
 
 If $ARGUMENTS is empty, output: "Usage: `/jot <fact worth remembering>`." Then stop.
 
-**KB root:** `$KB_DATA_DIR` · **CLI:** `$KB_ENGINE_DIR/scripts/kb` · **Schema:** `$KB_ENGINE_DIR/docs/schema.md`
+A jot is a normal leaf, minimal: the fact IS the summary, the body is the fact plus any context Gregor gave. Half the value of a KB is exactly these facts — they must not cost a ceremony. **One tool call.**
 
-A jot is a normal leaf entry, just minimal: full frontmatter, a 2–5 line body instead of a transcript. Half the value of a KB is exactly these facts — they must not require a full `/file-this` ceremony.
+## Procedure
 
-## Procedure (keep this under ~30 seconds of work)
+1. **Place it** from the ambient `<kb-ambient-index>` folder map already in context (only if nothing fits at all, run `$KB_ENGINE_DIR/scripts/kb routes --compact`; a genuinely new folder needs a `folder_purpose` sentence — it is hand-curated forever).
 
-1. **Place it.** Pick the folder from the ambient `<kb-ambient-index>` if it's in context, else run `$KB_ENGINE_DIR/scripts/kb routes --compact`. Use the existing folder that best fits; only create a new folder if nothing fits at all (then its `_route.md` needs a hand-written `purpose` — see the template).
+2. **Write it** — one command, JSON on stdin, `kb file` does ids, timestamps, YAML, validation, route bookkeeping and index refresh:
+   ```sh
+   "$KB_ENGINE_DIR/scripts/kb" file --jot --meta - <<'JSON'
+   {"title": "<the fact, ≤70 chars>",
+    "folder": "kb:/<existing folder>",
+    "topics": ["<2-4 tags, canonical forms from _topics.yaml where you know them>"],
+    "summary": "<the fact itself, self-contained, 1-3 sentences>",
+    "body": "<the fact again plus any context/link/caveat Gregor gave>",
+    "sources": ["<https:// links Gregor gave, if any>"],
+    "claims": [{"subject": "<area>.<thing>.<attribute>", "value": "<the value>", "since": "<YYYY-MM-DD if known>", "kind": "observed"}],
+    "decisions": [], "open_questions": [], "participants": ["gregor"]}
+   JSON
+   ```
+   A jot is almost always a **claim** (a current-state fact with a key) — include it so the engine can track when it changes. Reuse an existing subject (`kb subjects --match "<words>"`) before minting one; omit `claims` only for facts with no "current value" (history, a one-off number).
+   ```
+   ```
+   `kb file` prints `FILED <path>` or `REFUSED` with the schema errors (fix the payload, re-run — nothing was written).
 
-2. **Write the leaf.** Filename `<YYYY-MM-DD>-<slug>.md` (today UTC, slug from the fact). Standard entry frontmatter, all keys present:
-   - `title`: the fact, compressed to ≤ 70 chars.
-   - `topics`: 2–4 tags, normalized against `$KB_DATA_DIR/_topics.yaml`.
-   - `summary`: the fact itself, self-contained (1–3 sentences). This IS the payload.
-   - `decisions`/`open_questions`: usually `[]`; `recipe_candidate: false`.
-   - Body below the frontmatter: the fact again, plus any context Gregor gave (a link, a caveat). No transcript.
-
-3. **Sync:** `$KB_ENGINE_DIR/scripts/kb sync --quiet`
-
-4. **Confirm in one line:** `Jotted <id> → <path>`. Nothing else.
+3. **Confirm in one line:** `Jotted <id> → <path>`. Nothing else.
 
 ## Constraints
 
-- One fact per jot. If Gregor gave two unrelated facts, write two leaves (still one sync).
+- One fact per jot. Two unrelated facts → two `kb file` calls.
 - Don't pad the summary — a jot reader wants the fact, not prose.
-- Quote YAML strings containing `: ` or `#`.
 - No `git commit`.

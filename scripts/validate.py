@@ -47,9 +47,19 @@ ENTRY_REQUIRED = {"id", "title", "created", "updated", "status", "summary"}
 ENTRY_OPTIONAL_PRESENT = {
     "participants", "topics", "related", "sources",
     "supersedes", "superseded_by", "contradicts",
-    "decisions", "open_questions", "recipe_candidate",
+    "decisions", "open_questions", "recipe_candidate", "claims",
 }
 ENTRY_ALL = ENTRY_REQUIRED | ENTRY_OPTIONAL_PRESENT
+
+# Claims: keyed, dated facts asserted by an episode (the claim layer). Subject is a
+# dotted key (area.thing.attribute); scope is a mapping of dimension -> value(s);
+# since is YYYY-MM-DD; kind says how we know. Supersession/staleness are derived
+# by `kb` from these fields — nothing else is written into the file.
+CLAIM_KEYS = {"subject", "value", "scope", "since", "kind", "source"}
+CLAIM_REQUIRED = {"subject", "value"}
+CLAIM_KINDS = {"observed", "inferred", "reported"}
+SUBJECT_RE = re.compile(r"^[a-z0-9]+(\.[a-z0-9][a-z0-9-]*)+$")
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 ROUTE_REQUIRED = {"type", "folder", "title", "purpose", "last_indexed"}
 ROUTE_OPTIONAL_PRESENT = {"topics", "subroutes", "entries", "related"}
@@ -229,6 +239,32 @@ class Validator:
         rc = fm.get("recipe_candidate")
         if rc is not None and not isinstance(rc, bool):
             self.err(file, f"recipe_candidate must be true/false, got: {rc!r}")
+
+        # claims: list of keyed facts
+        claims = fm.get("claims")
+        if claims is not None and not isinstance(claims, list):
+            self.err(file, "claims must be a list")
+        for i, c in enumerate(claims or [], start=1):
+            if not isinstance(c, dict):
+                self.err(file, f"claims[{i}] must be a mapping")
+                continue
+            missing_c = CLAIM_REQUIRED - set(c)
+            if missing_c:
+                self.err(file, f"claims[{i}] missing {sorted(missing_c)}")
+            unknown_c = set(c) - CLAIM_KEYS
+            if unknown_c:
+                self.err(file, f"claims[{i}] has unknown keys {sorted(unknown_c)}")
+            subj = c.get("subject")
+            if not isinstance(subj, str) or not SUBJECT_RE.match(subj):
+                self.err(file, f"claims[{i}].subject must be a dotted key like area.thing.attribute, got {subj!r}")
+            if not isinstance(c.get("value"), str) or not c["value"].strip():
+                self.err(file, f"claims[{i}].value must be a non-empty string")
+            if "scope" in c and not isinstance(c["scope"], dict):
+                self.err(file, f"claims[{i}].scope must be a mapping (dimension -> value or list)")
+            if "since" in c and not (isinstance(c["since"], str) and DATE_RE.match(c["since"])):
+                self.err(file, f"claims[{i}].since must be YYYY-MM-DD, got {c.get('since')!r}")
+            if "kind" in c and c["kind"] not in CLAIM_KINDS:
+                self.err(file, f"claims[{i}].kind must be one of {sorted(CLAIM_KINDS)}")
 
     # ------------------------------------------------------------ recipe checks
 

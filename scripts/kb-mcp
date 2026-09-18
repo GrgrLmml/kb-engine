@@ -75,6 +75,29 @@ def kb_routes(compact: bool = True) -> str:
 
 
 @mcp.tool()
+def kb_facts(subject: str = "", scope: str = "", as_of: str = "", history: bool = False) -> str:
+    """Current claims per (subject, scope): value, since, kind, source, episode.
+    subject may be a prefix; scope is k=v (most specific wins); as_of YYYY-MM-DD."""
+    args = ["facts"] + ([subject] if subject else [])
+    if scope:
+        args += ["--scope", scope]
+    if as_of:
+        args += ["--as-of", as_of]
+    if history:
+        args.append("--history")
+    return _run(*args)
+
+
+@mcp.tool()
+def kb_check(text: str) -> str:
+    """The KB's current claims on every subject the given text touches — compare
+    the text against them to spot stale or wrong assertions."""
+    r = subprocess.run(["uv", "run", "--quiet", KB, "check"], input=text,
+                       capture_output=True, text=True, timeout=120)
+    return (r.stdout or "").strip() or "no current claims touch this text"
+
+
+@mcp.tool()
 def kb_problems(status: str = "") -> str:
     """The epistemic ledger: open conflicts in the theory layer and their
     pre-registered crucial experiments. Optional status filter:

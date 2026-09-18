@@ -32,6 +32,7 @@ find/grep pipelines, except to grep within files you've already located.
 2. **Search for what's missing.** If no candidates were given, or they don't
    answer the question:
    ```sh
+   $KB_ENGINE_DIR/scripts/kb facts <subject-or-prefix>   # current-state questions ("what is X now", "which", "does it"): dated, sourced claims in one line — answer from these before reading any transcript
    $KB_ENGINE_DIR/scripts/kb search <terms> -n 10
    ```
    The index is lexical — run 2–3 reformulations (tool names, ticket ids,

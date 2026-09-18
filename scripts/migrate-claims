@@ -1,0 +1,217 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["pyyaml>=6"]
+# ///
+"""migrate-claims — one-off: lift `decisions:` prose into keyed `claims:`.
+
+For every episode that has decisions and no claims yet, ask a cheap model to
+extract the current-state facts as (subject, value, scope, since, kind) claims,
+reusing the subject vocabulary as it grows (sequential, so later files see the
+keys earlier files minted). Writes the `claims:` block into the frontmatter
+(before `summary:`), logs every response, never touches anything else. Run
+`kb sync` afterwards to register subjects and rebuild the index.
+
+  migrate-claims [--limit N] [--model MODEL] [--dry-run] [--only ID]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+import yaml
+
+ROOT = Path(os.environ.get("KB_DATA_DIR") or Path(__file__).resolve().parent.parent / "kb-data")
+SUBJECT_RE = re.compile(r"^[a-z0-9]+(\.[a-z0-9][a-z0-9-]*)+$")
+KINDS = {"observed", "inferred", "reported"}
+
+
+class StrLoader(yaml.SafeLoader):
+    pass
+
+
+StrLoader.yaml_implicit_resolvers = {
+    k: [(t, r) for (t, r) in v if t != "tag:yaml.org,2002:timestamp"]
+    for k, v in StrLoader.yaml_implicit_resolvers.items()}
+
+
+def parse(path: Path):
+    text = path.read_text()
+    end = text.index("\n---\n", 4)
+    return yaml.load(text[4:end], Loader=StrLoader), text
+
+
+PROMPT = """You convert the `decisions` of one filed engineering conversation into CLAIMS.
+
+A CLAIM is a current-state fact with a key: "subject X has value V (in scope S) since date D".
+It is something that could become false later because the world changes: a setting, a
+threshold, a routing rule, a version, which service does what, where something lives, who
+owns what, which dashboard/monitor/job exists, a measured property of a system.
+NOT a claim: history ("we decided to…", "we fixed…"), a plan, priority or to-do, a one-off
+number from an investigation, an opinion, a framing, a recipe step. Test: would a colleague
+want this served next month as "X is currently Y"? If the answer depends on context (SaaS vs
+on-prem, prod vs dev, one language, one customer), that context is the `scope` — two values
+for one key WITHOUT scope is an error.
+
+Subject key format: <area>.<thing>.<attribute>, lowercase, dotted, hyphens inside segments.
+<thing> is the component or process (the retriever, the decoder, the vector store, a worker,
+the nightly eval, a maintenance job); <attribute> is a SHORT NOUN naming what has a value:
+similarity, tokenizer, temperature, threshold, timeout, schedule, version, owner, location,
+status, capacity, default, route, filter, gate. Never encode the value or a story in the key
+(bad: bm25-injection-vulnerability, filter-gaps; good: nn-retrieval.prefix-gating,
+nn-retrieval.bm25-filter). REUSE an existing subject whenever it names the same thing — a
+new key for an existing concept is the one mistake that hurts. Existing subjects:
+{subjects}
+
+Areas in use: {areas}. Prefer an existing area; invent a new area only when nothing fits.
+
+Fields per claim:
+- subject: the key
+- value: one line, concrete, self-contained (names, numbers, ids)
+- scope: ONLY for exceptions to a default, a mapping like {{"src_lang": ["lo","my"]}} or {{"env": "prod"}}
+- since: YYYY-MM-DD when the value became true if the text says; else the episode date {date}
+- kind: observed (seen in code/data/logs/UI), inferred (concluded), reported (someone said)
+- source: one URL from the sources list if it backs the claim
+
+Episode: {title} ({date})
+Summary: {summary}
+Decisions:
+{decisions}
+Sources: {sources}
+
+Return ONLY a JSON object {{"claims": [...]}} — at most 4 claims, only durable current-state
+facts a colleague would want served as "X is currently Y"; an empty list is a fine answer.
+No prose."""
+
+
+def ask(model: str, prompt: str) -> dict:
+    r = subprocess.run(["claude", "-p", prompt, "--model", model, "--output-format", "text"],
+                       capture_output=True, text=True, timeout=300)
+    out = r.stdout.strip()
+    m = re.search(r"\{.*\}", out, flags=re.S)
+    if not m:
+        raise ValueError(f"no JSON in reply: {out[:200]!r} / {r.stderr[:200]!r}")
+    return json.loads(m.group(0))
+
+
+def ydump(v) -> str:
+    s = yaml.safe_dump(v, default_flow_style=True, allow_unicode=True, width=10 ** 6).strip()
+    return s[:-4].strip() if s.endswith("\n...") else s
+
+
+def claims_block(claims: list[dict]) -> str:
+    if not claims:
+        return "claims: []"
+    lines = ["claims:"]
+    for c in claims:
+        lines.append(f"  - subject: {c['subject']}")
+        lines.append(f"    value: {ydump(c['value'])}")
+        for k in ("scope", "since", "kind", "source"):
+            if c.get(k) not in (None, "", {}):
+                lines.append(f"    {k}: {ydump(c[k])}")
+    return "\n".join(lines)
+
+
+def clean(claims, date: str, sources: list[str], vocab: set[str]) -> list[dict]:
+    out = []
+    for c in claims or []:
+        if not isinstance(c, dict):
+            continue
+        subj = str(c.get("subject") or "").strip().lower()
+        val = " ".join(str(c.get("value") or "").split())
+        if not SUBJECT_RE.match(subj) or len(val) < 3:
+            continue
+        item = {"subject": subj, "value": val}
+        sc = c.get("scope")
+        if isinstance(sc, dict) and sc:
+            item["scope"] = {str(k): ([str(x) for x in v] if isinstance(v, list) else str(v))
+                             for k, v in sc.items()}
+        since = str(c.get("since") or "")[:10]
+        item["since"] = since if re.match(r"^\d{4}-\d{2}-\d{2}$", since) else date
+        item["kind"] = c.get("kind") if c.get("kind") in KINDS else "inferred"
+        src = c.get("source")
+        if isinstance(src, str) and src in sources:
+            item["source"] = src
+        out.append(item)
+        vocab.add(subj)
+    return out[:4]
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--model", default="claude-haiku-4-5-20251001")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--only", help="episode id")
+    ap.add_argument("--shard", help="i/n — process only every n-th pending episode "
+                                    "(parallel workers; costs some vocabulary coherence, "
+                                    "repair afterwards with `kb subjects --dups/--rename`)")
+    args = ap.parse_args()
+
+    vocab: set[str] = set()
+    sub_yaml = ROOT / "_subjects.yaml"
+    if sub_yaml.is_file():
+        data = yaml.load(sub_yaml.read_text(), Loader=StrLoader) or {}
+        vocab.update((data.get("subjects") or {}).keys())
+    log = ROOT / ".librarian" / "log" / "claims-migration.jsonl"
+    log.parent.mkdir(parents=True, exist_ok=True)
+
+    files = []
+    for p in sorted(ROOT.rglob("*.md")):
+        if any(part.startswith(".") for part in p.relative_to(ROOT).parts) or p.name == "_route.md":
+            continue
+        fm, _ = parse(p)
+        if not isinstance(fm, dict) or fm.get("type") in ("recipe", "model", "problem", "route"):
+            continue
+        if not fm.get("decisions") or fm.get("claims"):
+            continue
+        if args.only and fm.get("id") != args.only:
+            continue
+        files.append((p, fm))
+    if args.shard:
+        i, n = (int(x) for x in args.shard.split("/"))
+        files = [f for k, f in enumerate(files) if k % n == i]
+    if args.limit:
+        files = files[: args.limit]
+    print(f"{len(files)} episode(s) with decisions and no claims; vocab starts at {len(vocab)} subjects")
+
+    done = 0
+    for p, fm in files:
+        date = str(fm.get("created") or "")[:10]
+        areas = sorted({s.split(".")[0] for s in vocab})
+        prompt = PROMPT.format(
+            subjects="\n".join(f"  {s}" for s in sorted(vocab)) or "  (none yet)",
+            areas=", ".join(areas) or "(none yet)", date=date, title=fm.get("title"),
+            summary=" ".join(str(fm.get("summary") or "").split())[:1500],
+            decisions="\n".join(f"- {d}" for d in fm["decisions"]),
+            sources=", ".join(str(s) for s in (fm.get("sources") or [])) or "(none)")
+        try:
+            reply = ask(args.model, prompt)
+        except Exception as e:
+            print(f"  FAIL {fm.get('id')}: {e}", file=sys.stderr)
+            continue
+        claims = clean(reply.get("claims"), date, [str(s) for s in (fm.get("sources") or [])], vocab)
+        with log.open("a") as f:
+            f.write(json.dumps({"at": datetime.now(timezone.utc).isoformat(), "id": fm.get("id"),
+                                "claims": claims}, ensure_ascii=False) + "\n")
+        print(f"  {fm.get('id')}: {len(claims)} claim(s)" +
+              ("".join(f"\n      {c['subject']} = {c['value'][:70]}" for c in claims)))
+        if args.dry_run:
+            continue
+        _, text = parse(p)
+        i = text.index("\nsummary:")
+        text = text[:i] + "\n" + claims_block(claims) + text[i:]
+        p.write_text(text)
+        done += 1
+    print(f"wrote claims into {done} file(s); now run: kb sync && validate.py")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

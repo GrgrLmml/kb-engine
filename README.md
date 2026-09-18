@@ -116,7 +116,7 @@ Claude Code refuses to prefix-match allow rules against commands containing vari
 - `commands/` — Claude Code slash commands (`/file-this`, `/jot`, `/find`, `/ask`, `/start`, `/promote`, `/dedup`, `/tidy`, `/extract-recipe`, `/mine-recipes`, `/graduate-recipe`, `/theorize`, `/criticize`, `/run-experiment`).
 - `skills/kb-recall/` — proactive-recall skill (symlinked into `~/.claude/skills` by install).
 - `agents/kb-researcher.md` — cheap read-only extraction subagent (symlinked into `~/.claude/agents` by install; used by `/ask` and `kb-recall`).
-- `librarian/procedure-file.md` — canonical filing procedure shared by the slash command and the headless librarian script.
+- `librarian/procedure-file.md` — canonical filing procedure shared by the slash command and the headless librarian script. Since v4 the LLM only distills a small JSON payload; `kb file` writes the leaf (machine-rendered transcript, schema validation, route bookkeeping, index refresh).
 - `scripts/kb` — the deterministic CLI (see below). `scripts/kb-mcp` — read-only MCP adapter over the CLI. `scripts/validate.py` — schema validator. `scripts/audit-topics.py` — topic normalization. `scripts/librarian` — headless maintenance (file / split / collapse / dedup / criticize / mine-recipes). `scripts/librarian-nightly` — the deterministic nightly job (launchd).
 - `hooks/session-start.sh` — tiered ambient payload (`kb ambient`). `hooks/auto-recall.sh` — semantic per-prompt recall (`kb recall`, registered by default). `hooks/capture-candidate.sh` — SessionEnd unfiled-session queue. `hooks/allow-kb-query.sh` — PreToolUse permission hook (see above). `hooks/pre-commit` — schema validator gate (kb-data). `hooks/pre-commit-no-leaks` — leak guard on the engine repo itself, scanning every commit against the private `$KB_DATA_DIR/_banned-terms.txt`. `hooks/normalize-topics.sh` — retired from per-session use (nightly `kb sync` covers it). `hooks/session-end.sh` — legacy unconditional auto-file (off by default).
 
@@ -158,7 +158,7 @@ derived data owned by `kb sync`. Hand-edited one-line entry summaries are preser
 `kb ambient --cwd <session-cwd>` as `<kb-ambient-index>`, tiered so cost is
 O(folders), not O(entries):
 
-- **Tier A (always, ~2-3k tokens):** folder map, recipe triggers, model statements.
+- **Tier A (always, ~2k tokens):** folder map, recipe triggers.
 - **Tier B (repo-relevant):** full one-line entry lists, but only for KB folders
   matching the repo the session opened in (basename + git-remote tokens; fails closed).
 - **Tier C (deltas):** the problem ledger's brief (counts, aging, ready experiments),
@@ -170,6 +170,28 @@ Pause with `touch $KB_DATA_DIR/.no-ambient`.
 via `kb recall`: head-vector cosine ∪ corroborated BM25, thresholds calibrated on the
 gold set's no-hit queries, session-scoped dedupe. Silence is the default; a hit
 injects at most 3 WARM summaries. Kill switch: `touch $KB_DATA_DIR/.no-auto-recall`.
+
+## The claim layer: facts with a key
+
+Episodes are what happened; **claims** are what is currently true. A claim is a decision with
+a key — `subject` (`<area>.<thing>.<attribute>`), `value`, optional `scope` (an exception's
+dimension, e.g. `{src_lang: [lo, my]}`), `since`, `kind` (`observed | inferred | reported`),
+`source` — written into the frontmatter of the episode that asserted it. Nothing else is stored:
+`kb` **derives** which claim is current per `(subject, scope)`, what superseded what (same key,
+later `since`, different value), what was re-confirmed (same value), and what has gone stale
+(each subject has a decay class in `_subjects.yaml`). Similarity can't do this job — a
+contradicted fact and a duplicated fact look the same to an embedding — a key can.
+
+- `kb facts <subject> [--scope k=v] [--as-of DATE] [--history]` — "X is currently Y (since D,
+  source S), except Z"; most specific scope wins, the unscoped claim is the default.
+- `kb check` (text on stdin) — the KB's claims on every subject a text touches, so a bot's
+  answer, a tool result or a draft reply can be compared against dated, sourced facts.
+  `/check` runs it by hand; a `PostToolUse` hook runs it on MCP/WebFetch results automatically.
+- Auto-recall serves a matched subject's whole current view (default + exceptions) as one line
+  ahead of any episode; `kb file` reports, per new claim, whether it confirms or **supersedes**
+  an earlier one.
+- `kb doctor` adds `conflict` (same key, same day, different values), `stale-claim`,
+  `weak-supersession` (an observed fact overridden by hearsay) and `unknown-subject`.
 
 ## MCP: the KB outside Claude Code
 

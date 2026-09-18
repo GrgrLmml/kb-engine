@@ -14,6 +14,7 @@ contradicts: []
 recipe_candidate: false
 decisions: []
 open_questions: []
+claims: []            # keyed facts this episode asserts — see docs/schema.md "Claims"
 summary: |
   {{two-paragraph distilled summary — what was discussed, what was decided, what's still open}}
 ---

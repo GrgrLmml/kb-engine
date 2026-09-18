@@ -1,78 +1,52 @@
 # Filing procedure (canonical)
 
-This is the single source of truth for how a conversation gets filed into Gregor's KB. Both `/file-this` (live in a Claude Code session) and the headless librarian script read this file and follow it.
+This is the single source of truth for how a conversation gets filed into Gregor's KB. Both `/file-this` (live in a Claude Code session) and the headless librarian script follow it.
 
----
+**Division of labour:** you *judge* (what this conversation was, where it belongs, what was decided); `kb file` *writes* (id, timestamps, YAML quoting and key order, the transcript, folder bootstrap, schema validation, route bookkeeping, index refresh). Never hand-write a leaf file or a `_route.md`; never re-type the transcript.
 
-**KB root:** `$KB_DATA_DIR`
-**Schema contract:** `$KB_ENGINE_DIR/docs/schema.md` — read it before writing any frontmatter, and follow it exactly.
-**Templates:** `$KB_ENGINE_DIR/templates/entry.md.template` and `_route.md.template`.
-**CLI:** `$KB_ENGINE_DIR/scripts/kb` — does ALL route bookkeeping mechanically. You write the leaf; it does the rest.
+**CLI:** `$KB_ENGINE_DIR/scripts/kb` · **KB root:** `$KB_DATA_DIR` · **Schema (reference only, you don't write it):** `$KB_ENGINE_DIR/docs/schema.md`
 
 You will be told whether the conversation to file is:
-- **The current session's context** (when invoked via `/file-this`), or
-- **A transcript on disk** at a path you'll be given (when invoked headlessly). In that case, Read the file first; it is JSONL with one message per line.
+- **the current session** (via `/file-this`) — it is already in your context; use `--session auto --cwd "$PWD"`, or
+- **a transcript on disk** (headless) — read it with `$KB_ENGINE_DIR/scripts/kb transcript <path>` (condensed, faithful; never Read the raw JSONL), then use `--session <path>`.
 
-You may also be given an optional one-line hint about placement.
+An optional one-line placement hint may be given.
 
-## Procedure
+## Procedure — two tool calls in the common case
 
-You have exactly three judgment steps (1–3) and one mechanical step (4).
+1. **Distill** (no tool call — think):
+   - `title` ≤ 70 chars.
+   - `summary`: two paragraphs, self-contained — someone reading only this must know what the entry is about and what came out of it. This is the WARM-tier payload and the main retrieval surface.
+   - `topics`: 3–6 tags. Use canonical forms from `$KB_DATA_DIR/_topics.yaml` when you know them (`kb sync` normalizes aliases afterwards anyway). Don't merge a tag onto a polysemous term with a different meaning (e.g. `backend` → prefer `model-generation` / `routing`).
+   - `decisions`: every explicit decision, one line each, self-contained (a reader should not need the transcript to understand them; name the thing decided and the reason).
+   - `claims`: the **current-state facts** this conversation established, keyed so the engine can track them over time — anything that could be false tomorrow because the world changed: a setting, a threshold, a routing rule, which service does what, who owns what, which dashboard/monitor is live. Each: `{"subject": "<area>.<thing>.<attribute>", "value": "<the value, one line>", "since": "YYYY-MM-DD", "kind": "observed|inferred|reported", "scope": {"dim": "v"} (only for exceptions), "source": "<url>"}`. Reuse existing subjects: run `kb subjects --match "<words>"` once if unsure — a new key when an existing one means the same thing is the one mistake that hurts. History ("we decided X") stays in `decisions`; state ("X is now Y") goes in `claims`. Most short conversations have 0–3 claims; that is fine.
+   - `open_questions`: what was left dangling.
+   - `sources`: external URLs mentioned (Jira / Slack / PR permalinks / gs://). Nothing else.
+   - `participants`: default `["gregor"]`.
+   - `recipe_candidate`: `true` only if the conversation composed ≥3 distinct tools/data sources AND reached a repeatable outcome (a method you'd run again). One-off investigations, single decisions, 1:1 notes: `false`.
+   - `folder`: the `kb:/` folder whose purpose best matches — from the ambient `<kb-ambient-index>` folder map if in context, else run `kb routes --compact` once. Prefer the hint if given, unless it clearly misfiles. If no folder fits and the topic warrants its own, name a new folder one level below an existing one and give `folder_purpose` (one good sentence — hand-curated forever).
 
-1. **Distill the conversation.** Identify:
-   - Short title (≤ 70 chars)
-   - Participants (default: just `gregor`)
-   - 3–6 topic tags — **normalize each against the controlled vocabulary** in `$KB_DATA_DIR/_topics.yaml`: if a tag matches a canonical term's alias, use the canonical form. Do NOT merge a tag whose meaning differs from a `polysemous` term that shares its spelling (e.g. `backend`); prefer the more specific canonical the file suggests (`model-generation`, `routing`). If a genuinely new concept has no canonical, use a clean new tag (and it can be added to the vocabulary later).
-   - Any explicit decisions made
-   - Any open questions left dangling
-   - A two-paragraph summary suitable for the WARM tier (someone reading only this should know what the entry is about)
-   - Any external sources mentioned (knowledge tools / Jira / Slack / code permalinks)
-
-2. **Pick the placement folder.** Run `$KB_ENGINE_DIR/scripts/kb routes --compact` (one Bash call, a few thousand tokens) and pick the folder whose purpose and entries best match the conversation. If the session's ambient `<kb-ambient-index>` is already in context, use that instead — no need to re-emit it.
-   - If no existing folder fits and the conversation is clearly about a new topic that warrants its own folder: `mkdir` it and create its `_route.md` from the template, filling **only** `type`, `folder`, `title`, `purpose` (one good sentence — it's hand-curated forever) and empty `topics/subroutes/entries/related`. Prefer creating new folders over cramming unrelated entries into existing ones.
-   - If a hint was provided, prefer it over your own routing decision unless it would clearly misfile the entry.
-
-3. **Write the leaf entry.**
-   - Filename: `<YYYY-MM-DD>-<slug>.md` where date is today UTC (`date -u +%Y-%m-%d`) and slug is lowercase, hyphenated, derived from the title.
-   - Path: `<placement folder>/<filename>`.
-   - Use the entry template. Fill every field. Required: `id`, `title`, `created`, `updated`, `status`, `summary`. Empty arrays/`null` fine for the rest, but the keys must be present.
-   - `id` = `<YYYY-MM-DD>-<slug>` (matches filename without extension).
-   - `created` = current ISO 8601 UTC timestamp. `updated` = same.
-   - **Set `recipe_candidate`** (auto-flag for the recipe mining pass): `true` when this conversation looks like a *reusable procedure* — it composed **≥3 distinct tools/data sources** (DB, Jira, Slack, codebase, k8s, Datadog, the KB, web) AND reached a **repeatable** outcome (a method you'd run again), especially if it used words like recipe/playbook/runbook/recurring. A one-off investigation, a single decision, or a 1:1 note is `false`. This is a cheap hint, not a commitment — it just tells `/mine-recipes` where to look. Do NOT create the recipe here; `/extract-recipe` and the mining pass do that.
-   - Below frontmatter, paste a faithful transcript of the conversation. Do not summarize the transcript — the `summary` field already does that. The transcript is the HOT-tier payload.
-
-4. **Sync.** One command does everything that used to be manual bookkeeping (parent `entries[]`, new-folder `subroutes[]`, `last_indexed` bumps, topic normalization, search-index refresh):
-   ```bash
-   $KB_ENGINE_DIR/scripts/kb sync
+2. **Write** — one call:
+   ```sh
+   "$KB_ENGINE_DIR/scripts/kb" file --session auto --cwd "$PWD" --meta - <<'JSON'
+   {"title": "...", "folder": "kb:/work/...", "topics": ["..."], "participants": ["gregor"],
+    "summary": "...\n\n...", "decisions": ["..."], "open_questions": ["..."],
+    "sources": ["https://..."], "recipe_candidate": false,
+    "claims": [{"subject": "service.decoder.sampling-temperature", "value": "0 (greedy), settings default", "since": "2026-09-15", "kind": "observed", "source": "https://..."}]}
+   JSON
    ```
-   Read its output: note any topic-polysemy warnings (they are not auto-changed and may need a manual, more-specific tag). Do NOT hand-edit any `_route.md` entries/subroutes/last_indexed — `kb sync` owns those now. The derived one-line entry summary in the route is taken from your leaf `summary`'s first sentence; if you can write a sharper ≤100-char one-liner, you may edit it in the route afterwards (it is preserved on future syncs).
+   (headless: `--session <jsonl path>` instead of `auto`.) It prints either `FILED <path>` plus a report, or `REFUSED` with schema errors — then nothing was written; fix the payload and re-run. The report says, per claim, whether it **confirms** or **SUPERSEDES** an earlier claim on the same key (that is the engine noticing the world changed — no action needed, but if a supersession surprises you, say so in your report) and flags **new subjects** — if `kb subjects --match` shows an existing key that means the same thing, edit the leaf's `claims[].subject` to it and `kb sync`.
 
-5. **Test the living layer** (models + recipes — the revision loop that keeps current-state claims current). Episodes are immutable history; models and recipes are the KB's *revisable claims about now*, and this is the moment they get checked against fresh evidence. The living layer is deliberately small, so sweep ALL of it — no topic-matching shortcuts.
+3. **Check the living layer** — only what the report lists. `kb file` ends with `same-topic living layer:` — the models and recipes sharing a topic with the new entry (usually none). For each listed id, `kb show <id>`, read `statement`/`predictions` (model) or `when_to_use`/`steps` (recipe), and compare against what you just filed:
+   - **Model contradicted** by this episode → append the new id to `refuted_by`, bump `updated`, flag it in your report. Do NOT flip the status — Gregor decides refute-vs-boundary-condition.
+   - **Model prediction matched** → append the new id to `evidence_for` (never for a model whose `derived_from` already holds it — grounding isn't corroboration), bump `updated`; first later match flips `hypothesis → corroborated` (survived a test; never "validated").
+   - **Recipe claim outdated** (a step, a "currently X" caveat) → edit the recipe text in place, cite the new id, append it to `derived_from`, bump `updated`. **Recipe executed successfully** → bump `last_verified`.
+   - Neither → nothing. If you edited anything: `"$KB_ENGINE_DIR/scripts/kb" sync --quiet`.
 
-   **5a. Models** (skip only if `kb:/models/` doesn't exist). Read the frontmatter of every non-superseded model under `kb:/models/` (`statement`, `predictions`, `evidence_for`, `refuted_by`) and compare against the entry you just filed. Check for refutation FIRST — one counterexample outweighs any amount of corroboration:
-   - The new episode **contradicts the statement or a prediction** → append the entry id to `refuted_by`, bump `updated:`, and flag it in your report — do NOT silently flip status to `refuted`; Gregor decides whether the model dies or gains a boundary condition.
-   - The new episode **matches a prediction** → append the entry id to that model's `evidence_for` (never to a model whose `derived_from` already contains it — grounding isn't corroboration), bump `updated:`. If this is the first later episode to test it, flip `status: hypothesis → corroborated` — corroborated means *survived a test*, never proven; a future counterexample still kills it.
-   - Neither → move on. Most filings touch no model.
-
-   **5b. Recipes** (skip only if `kb:/recipes/` doesn't exist). Read the frontmatter of every non-superseded recipe (`when_to_use`, `steps`, `summary`) and compare against the entry you just filed. Unlike episodes, recipes are living documents — when the world changed, the recipe text changes:
-   - The new episode **outdates a claim in the recipe** (a step, a caveat, a "currently X" / "not yet Y" status assertion) → EDIT the recipe in place: fix the claim (cite the entry id where useful), append the entry id to `derived_from`, add the entry to `related`, bump `updated:`, and flag it in your report. Never leave a refuted status assertion standing — a stale "honest caveat" is worse than none, because it gets served with the recipe's authority.
-   - The new episode **is a successful execution of the recipe** (in whole or in part) → bump `last_verified:` (and `updated:`), and fold in any newly learned gotchas as step refinements.
-   - Neither → move on. Most filings touch no recipe.
-
-   If you edited any model or recipe, re-run `kb sync`.
-
-6. **Report back.** Output a short summary:
-   - Where the entry was filed (full path).
-   - Any new folders created.
-   - The entry's `id`, `topics`, and one-line summary.
-   - Any model confirmations/refutations from step 5a (`<model-id>: confirmed by this entry` / `REFUTATION FLAGGED — review <model-id>`).
-   - Any recipe revisions/verifications from step 5b (`<recipe-id>: claim updated — <one line>` / `<recipe-id>: last_verified bumped`).
+4. **Report back**, short: the `FILED` path and id, topics, one-line summary, any model/recipe flags from step 3 (`REFUTATION FLAGGED — review <model-id>` / `<recipe-id>: step updated — <one line>`).
 
 ## Constraints
 
-- Do not invent participants or sources. If you don't know, leave the field empty.
-- Do not add `contradicts:` entries on the first pass — that's a later slice.
-- All paths in frontmatter use the `kb:/` URI scheme. The kb-data filesystem root is `$KB_DATA_DIR` but inside frontmatter that's `kb:/`. External URLs (`https://...`) keep their normal form. Bare ids (in `supersedes` / `contradicts`) need no prefix.
-- Use ISO 8601 UTC for all timestamps. Append `Z`.
-- Quote any list-item or scalar string that contains a `:` followed by space, **or a `#`** (e.g. `PR #140`, mentions of `key: value` inside prose). Bare colons break YAML parsing; an unquoted ` #` silently truncates the value as a comment. Wrap the whole string in double quotes.
+- Do not invent participants, decisions or sources. Unknown → leave empty.
+- `decisions` are facts about the world/our systems as decided or established in the conversation — not a to-do list.
 - Do not run `git commit`. Filing produces working-tree changes only; Gregor reviews and commits manually.

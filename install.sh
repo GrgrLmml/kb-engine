@@ -30,6 +30,7 @@ START_HOOK="$KB_ENGINE_DIR/hooks/session-start.sh"
 ALLOW_HOOK="$KB_ENGINE_DIR/hooks/allow-kb-query.sh"
 RECALL_HOOK="$KB_ENGINE_DIR/hooks/auto-recall.sh"
 CAPTURE_HOOK="$KB_ENGINE_DIR/hooks/capture-candidate.sh"
+CHECK_HOOK="$KB_ENGINE_DIR/hooks/check-tool-output.sh"
 
 KB_DATA_DIR="$KB_ENGINE_DIR/kb-data"
 ASSUME_YES=0
@@ -76,7 +77,7 @@ if [ "$UNINSTALL" = 1 ]; then
     done
   fi
   if [ -f "$SETTINGS" ] && [ -n "$PY" ]; then
-    "$PY" - "$SETTINGS" "$KB_ENGINE_DIR" "$KB_DATA_DIR" "$HOOK" "$START_HOOK" "$ALLOW_HOOK" "$RECALL_HOOK" "$CAPTURE_HOOK" <<'PYEOF'
+    "$PY" - "$SETTINGS" "$KB_ENGINE_DIR" "$KB_DATA_DIR" "$HOOK" "$START_HOOK" "$ALLOW_HOOK" "$RECALL_HOOK" "$CAPTURE_HOOK" "$CHECK_HOOK" <<'PYEOF'
 import json, sys
 p, mech, data, *ours = sys.argv[1:]
 d = json.load(open(p))
@@ -84,7 +85,7 @@ d.get("env", {}).pop("KB_ENGINE_DIR", None)
 d.get("env", {}).pop("KB_DATA_DIR", None)
 if d.get("env") == {}: d.pop("env", None)
 hooks = d.get("hooks", {})
-for event in ("SessionEnd", "SessionStart", "UserPromptSubmit", "PreToolUse"):
+for event in ("SessionEnd", "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse"):
     groups = hooks.get(event, [])
     for grp in groups:
         grp["hooks"] = [h for h in grp.get("hooks", []) if h.get("command") not in ours]
@@ -228,9 +229,9 @@ if [ -z "$PY" ]; then warn "python3 unavailable — skipping settings edit; set 
   fi
   if [ "$do_it" = 1 ]; then
     mkdir -p "$CLAUDE_DIR"; [ -f "$SETTINGS" ] || echo '{}' > "$SETTINGS"
-    "$PY" - "$SETTINGS" "$KB_ENGINE_DIR" "$KB_DATA_DIR" "$HOOK" "$START_HOOK" "$ALLOW_HOOK" "$RECALL_HOOK" "$CAPTURE_HOOK" <<'PYEOF'
+    "$PY" - "$SETTINGS" "$KB_ENGINE_DIR" "$KB_DATA_DIR" "$HOOK" "$START_HOOK" "$ALLOW_HOOK" "$RECALL_HOOK" "$CAPTURE_HOOK" "$CHECK_HOOK" <<'PYEOF'
 import json, sys
-p, mech, data, hook, start_hook, allow_hook, recall_hook, capture_hook = sys.argv[1:9]
+p, mech, data, hook, start_hook, allow_hook, recall_hook, capture_hook, check_hook = sys.argv[1:10]
 d = json.load(open(p))
 d.setdefault("env", {})["KB_ENGINE_DIR"] = mech
 d["env"]["KB_DATA_DIR"] = data
@@ -265,6 +266,13 @@ if not any(h.get("command") == capture_hook for g in se2 for h in g.get("hooks",
     # capture-candidate queue (deterministic, no LLM) — feeds UNFILED SESSIONS
     se2.append({"hooks": [{"type": "command", "command": capture_hook,
                            "async": True, "timeout": 15}]})
+post = hooks.setdefault("PostToolUse", [])
+if not any(h.get("command") == check_hook for g in post for h in g.get("hooks", [])):
+    # claim check on external knowledge tools (MCP servers, WebFetch): inject the
+    # KB's current claims on subjects the result touches, so a bot's stale
+    # "cosine similarity" gets compared against the dated, sourced fact
+    post.append({"matcher": "mcp__.*|WebFetch",
+                 "hooks": [{"type": "command", "command": check_hook, "timeout": 15}]})
 perms = d.setdefault("permissions", {})
 allow = perms.setdefault("allow", [])
 for rule in (

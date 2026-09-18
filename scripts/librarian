@@ -2,7 +2,7 @@
 # librarian — headless KB maintenance for Gregor's personal knowledge base.
 #
 # Usage:
-#   librarian file         --transcript <path> [--session-id <id>] [--hint <text>]
+#   librarian file         (--transcript <path> | --session auto --cwd <dir>) [--session-id <id>] [--hint <text>]
 #   librarian split        <kb-path>           [--session-id <id>]
 #   librarian collapse     <kb-path>           [--session-id <id>]
 #   librarian dedup        <kb-path>           [--session-id <id>]
@@ -40,6 +40,8 @@ CLAUDE_BIN="${CLAUDE_BIN:-claude}"
 
 MODE=""
 TRANSCRIPT=""
+SESSION_REF=""
+CWD_ARG=""
 SESSION_ID=""
 HINT=""
 FOLDER=""
@@ -71,6 +73,8 @@ fi
 while [ $# -gt 0 ]; do
   case "$1" in
     --transcript)  TRANSCRIPT="$2"; shift 2 ;;
+    --session)     SESSION_REF="$2"; shift 2 ;;
+    --cwd)         CWD_ARG="$2"; shift 2 ;;
     --session-id)  SESSION_ID="$2"; shift 2 ;;
     --hint)        HINT="$2"; shift 2 ;;
     --folder)      FOLDER="$2"; shift 2 ;;
@@ -78,8 +82,17 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if [ "$MODE" = "file" ] && [ -z "$TRANSCRIPT" ]; then
-  echo "--transcript <path> required for 'file' mode" >&2
+# `--session auto --cwd <dir>` resolves the live session the prompt hook recorded
+# for that cwd (what /file-this --bg passes); `--transcript <path>` is explicit.
+if [ "$MODE" = "file" ] && [ -z "$TRANSCRIPT" ] && [ "$SESSION_REF" = "auto" ]; then
+  SLUG="$(printf '%s' "${CWD_ARG:-$PWD}" | sed -E 's/[^A-Za-z0-9]+/-/g; s/^-|-$//g')"
+  STATE="$KB_DATA_DIR/.index/sessions/$SLUG.json"
+  [ -f "$STATE" ] && TRANSCRIPT="$(jq -r '.transcript_path // empty' "$STATE" 2>/dev/null || true)"
+elif [ "$MODE" = "file" ] && [ -z "$TRANSCRIPT" ] && [ -n "$SESSION_REF" ]; then
+  TRANSCRIPT="$SESSION_REF"
+fi
+if [ "$MODE" = "file" ] && { [ -z "$TRANSCRIPT" ] || [ ! -f "$TRANSCRIPT" ]; }; then
+  echo "file mode needs --transcript <path> (or --session auto --cwd <dir> with a recorded session)" >&2
   exit 2
 fi
 if [[ "$MODE" =~ ^(split|collapse|dedup)$ ]] && [ -z "$FOLDER" ]; then
@@ -163,8 +176,10 @@ case "$MODE" in
     cat > "$PROMPT_FILE" <<EOF
 Read $MECHANICS/librarian/procedure-file.md and follow it.
 
-The conversation to file is the JSONL transcript at: $TRANSCRIPT
-Read that file with the Read tool to load the conversation. Each line is one message.
+The conversation to file is the session transcript at: $TRANSCRIPT
+Load it with ONE Bash call — never Read the raw JSONL:
+  $KB_ENGINE_DIR/scripts/kb transcript "$TRANSCRIPT" --owner Gregor
+When you reach the write step, use: --session "$TRANSCRIPT" (not auto).
 
 User hint about placement (may be empty): $HINT
 

@@ -10,7 +10,7 @@ Five file shapes live in `kb-data/`:
 
 All paths inside frontmatter use the **`kb:/` URI scheme**, rooted at the kb-data directory (e.g. `kb:/people/alex/_route.md`). Tooling resolves `kb:/` → `$KB_DATA_DIR/` at read time. The scheme makes it impossible to confuse with a filesystem path.
 
-External references (knowledge tools, Jira, Slack, code permalinks) keep their normal `https://` URLs unchanged; `gs://` artifact URIs are also allowed in `sources`. Local file paths and prose descriptions are NOT sources — put them in the body. `id` references in `supersedes` / `contradicts` / `superseded_by` are bare ids, not paths.
+External references (issue tracker, chat, code permalinks, knowledge tools) keep their normal `https://` URLs unchanged; `gs://` artifact URIs are also allowed in `sources`. Local file paths and prose descriptions are NOT sources — put them in the body. `id` references in `supersedes` / `contradicts` / `superseded_by` are bare ids, not paths.
 
 All timestamps are **ISO 8601 UTC** (e.g. `2026-05-05T14:30:00Z`).
 
@@ -29,7 +29,7 @@ topics: [1to1, alex, q2-planning]     # tags. Normalized against kb-data/_topics
 related:                              # cross-graph links. Cyclic ok. kb:/ scheme.
   - kb:/people/alex/_route.md
   - kb:/processes/1to1/_route.md
-sources:                              # external pointers (knowledge tools / Jira / Slack / code permalinks / gs:// artifacts). http(s) or gs:// only. Optional.
+sources:                              # external pointers (issue tracker / chat / code permalinks / gs:// artifacts). http(s) or gs:// only. Optional.
   - https://example.atlassian.net/browse/...
 status: active                        # active | superseded | archived
 supersedes: []                        # ids of entries this replaces (newest-wins)
@@ -40,6 +40,7 @@ decisions:
   - Bump priority of X over Y
 open_questions:
   - When does the migration land?
+claims: []                            # keyed facts this episode asserts (see "Claims" below)
 summary: |
   Two-paragraph distilled summary. This is the WARM-tier payload — the routing
   agent reads only this to decide whether to load the full transcript.
@@ -60,6 +61,55 @@ summary: |
 - **`contradicts`**: Ids of entries this disagrees with. The librarian adds a one-line note to `summary` when it sets this.
 - **`recipe_candidate`**: Optional boolean (default absent/`false`). Set `true` at filing time when the conversation looks like a *reusable procedure* — it composed several tools/data sources and reached a repeatable outcome. The recipe mining pass (`/mine-recipes`) uses this as a cheap priority signal: `grep -rl 'recipe_candidate: true'`. It's a hint, not a commitment — mining still judges before minting a recipe.
 - **`summary`**: Load-bearing. The retriever decides HOT/WARM/COLD based on this. Keep it self-contained — a reader who only sees the summary should still understand what the entry is about.
+- **`claims`**: Optional list of keyed facts this episode asserts — see the next section.
+
+### Claims (`claims:` on a leaf entry)
+
+A **claim** is a decision with a key: *subject X currently has value V (in scope S), since D*.
+Where `decisions` are prose, claims are addressable — the engine can tell that two episodes
+speak about the same thing, which one is newer, and whether they agree. Claims live in the
+episode that asserted them (provenance for free; episodes stay immutable). Everything else —
+which claim is current, what superseded what, what was re-confirmed, what has gone stale —
+is **derived** by `kb` from the `(subject, scope)` key and dates. Nothing derived is ever
+written back into the file.
+
+```yaml
+claims:
+  - subject: search.retrieval.similarity    # dotted key: <area>.<thing>.<attribute>  (see _subjects.yaml)
+    value: lexical scoring (token overlap) for the ranked candidate list
+    since: 2026-05-22                       # YYYY-MM-DD the value became true (default: the episode date)
+    kind: observed                          # observed | inferred | reported  (default: observed)
+    source: https://example.atlassian.net/browse/TICKET-123
+  - subject: search.retrieval.similarity
+    value: dense vector cosine — the tokenizer cannot segment these scripts
+    scope: {src_lang: [xx, yy]}             # dimension -> value or list; omitted = the default
+    since: 2026-05-22
+```
+
+Rules (deterministic, in `kb`):
+
+- **Key** = `(subject, scope)`. Same key, later `since`, different `value` → the older claim is
+  superseded (`kb facts --history` shows the chain). Same value → the older claim is *confirmed*
+  (its `confirmed` date moves forward), which resets the staleness clock.
+- **Scope resolution**: `kb facts <subject> --scope k=v` picks the most specific applicable
+  claim; the unscoped claim is the default. Exceptions are therefore first-class, not prose.
+- **As-of**: `kb facts <subject> --as-of 2026-05-01` answers "what was true then".
+- **Staleness**: each subject has a decay class (`_subjects.yaml`: `config` 90 d, `topology`
+  180 d, `relational` 180 d, `never`). An unconfirmed current claim older than its half-life is a
+  `kb doctor: stale-claim` finding — re-verify it (a new episode with the same value) or
+  supersede it.
+- **Conflict**: same key, same `since`, different values → `kb doctor: conflict`.
+- **`kind`** travels with every served claim: `observed` (seen in code/data/logs), `inferred`
+  (concluded), `reported` (someone said so). An `observed` claim overridden by a weaker kind is
+  flagged (`weak-supersession`).
+- **Subjects** are a living vocabulary: `kb sync` auto-registers any new subject in
+  `_subjects.yaml`; `aliases` and `decay` are hand-curated there. Before minting a subject, check
+  `kb subjects --match <words>` for an existing key.
+
+What makes a good claim: it is about the *current state* of a system, process, ownership or
+setting ("the LLM translation path samples at temperature 0", "monitor 1234 filters on
+test_set gold-v2"), not a to-do and not a narrative. If it could be false tomorrow because
+the world changed, it is a claim. If it is history ("we decided X on date D"), it is a decision.
 
 ---
 

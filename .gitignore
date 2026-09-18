@@ -7,3 +7,7 @@ __pycache__/
 *.pyc
 .venv/
 .DS_Store
+
+# Local-only docs: working notes, experiment reports, plans with internal detail.
+# They live next to the code but never ship with the public repo.
+*.local.md
