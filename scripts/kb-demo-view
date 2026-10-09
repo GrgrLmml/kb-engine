@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""kb-demo-view — build a privacy-filtered, disposable copy of the KB for live demos.
+
+Why a copy instead of a filter flag: every hook and every `kb` subcommand resolves
+the KB through $KB_DATA_DIR. Point that at a filtered tree and nothing in the
+retrieval path (ambient index, auto-recall, search, routes, /ask subagents) can
+reach what was left out. No code path to audit, and the result is grep-able.
+
+    scripts/kb-demo-view                 # build into $TMPDIR/kb-demo-view, report
+    scripts/kb-demo-view --redact        # also replace banned-term hits with [redacted]
+    scripts/kb-demo-view --launch        # build, then exec `claude` against the copy
+    scripts/kb-demo-view --out DIR       # another target (must contain "kb-demo")
+
+Config, both in the private kb-data (never in this repo):
+    $KB_DATA_DIR/_demo-exclude.txt   one path per line relative to kb-data: a folder
+                                     (people, work/hiring) or a single file
+                                     (recipes/some-recipe.md). # comments allowed.
+                                     Created with a default list if missing.
+    $KB_DATA_DIR/_demo-banned-terms.txt
+                                     terms that must not appear in front of THIS
+                                     audience (candidate names, personal matters).
+                                     Whole-word, case-insensitive scan of the copy.
+                                     NOT _banned-terms.txt: that list protects the
+                                     public engine repo and bans company terms an
+                                     internal audience is allowed to see.
+
+What the build does:
+    1. copy kb-data -> OUT, skipping .git/.index/.librarian and every excluded path
+    2. strip frontmatter edges (related/sources/supersedes/superseded_by/contradicts)
+       that point into an excluded path, so no "what links here" leaks a title
+    3. scan the copy for banned terms; list hits and exit 1, or --redact them
+    4. drop the capture queue and disable auto-commit in the copy
+    5. KB_DATA_DIR=OUT kb reindex-routes + kb index  (routes regenerate from leaves)
+    6. print the launch command; --launch runs it
+
+Launch (what --launch does):
+    claude --settings '{"env":{"KB_DATA_DIR":"OUT"}}'
+Command-line settings override ~/.claude/settings.json, and hooks inherit the env.
+Verify inside the demo session with `! echo $KB_DATA_DIR` before you start.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ENGINE = Path(__file__).resolve().parent.parent
+DEFAULT_EXCLUDE = ["people", "work/hiring"]
+ALWAYS_SKIP = {".git", ".index", ".librarian", ".DS_Store",
+               "_banned-terms.txt", "_demo-exclude.txt", "_demo-banned-terms.txt"}
+EDGE_KEYS = ("related", "sources", "contradicts", "supersedes")
+SCALAR_EDGE_KEYS = ("superseded_by",)
+
+
+def kb_root() -> Path:
+    root = os.environ.get("KB_DATA_DIR") or str(ENGINE / "kb-data")
+    p = Path(root).resolve()
+    if not (p / "_route.md").exists():
+        sys.exit(f"kb-demo-view: KB_DATA_DIR has no _route.md: {p}")
+    return p
+
+
+def read_list(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text().splitlines():
+        s = line.strip()
+        if s and not s.startswith("#"):
+            out.append(s)
+    return out
+
+
+def load_exclude(root: Path) -> list[str]:
+    f = root / "_demo-exclude.txt"
+    if not f.exists():
+        f.write_text(
+            "# kb-demo-view: paths (relative to kb-data) left OUT of the demo copy.\n"
+            "# Folders or single files. One per line.\n"
+            + "\n".join(DEFAULT_EXCLUDE) + "\n")
+        print(f"created {f} with defaults: {', '.join(DEFAULT_EXCLUDE)}")
+    return [e.strip("/") for e in read_list(f)]
+
+
+def is_excluded(rel: str, excludes: list[str]) -> bool:
+    return any(rel == e or rel.startswith(e + "/") for e in excludes)
+
+
+def excluded_uri(uri: str, excludes: list[str]) -> bool:
+    # kb:/people/kostas/_route.md  ->  people/kostas/_route.md
+    m = re.match(r"^kb:/+(.*)$", uri.strip().strip("'\""))
+    return bool(m) and is_excluded(m.group(1), excludes)
+
+
+def copy_tree(src: Path, dst: Path, excludes: list[str]) -> tuple[int, int]:
+    kept = dropped = 0
+    for dirpath, dirnames, filenames in os.walk(src):
+        rel_dir = os.path.relpath(dirpath, src)
+        rel_dir = "" if rel_dir == "." else rel_dir
+        keep_dirs = []
+        for d in dirnames:
+            if d in ALWAYS_SKIP:
+                continue
+            if is_excluded(f"{rel_dir}/{d}".strip("/"), excludes):
+                dropped += sum(len(fs) for _, _, fs in os.walk(os.path.join(dirpath, d)))
+                continue
+            keep_dirs.append(d)
+        dirnames[:] = keep_dirs
+        for fn in filenames:
+            if fn in ALWAYS_SKIP:
+                continue
+            rel = f"{rel_dir}/{fn}".strip("/")
+            if is_excluded(rel, excludes):
+                dropped += 1
+                continue
+            target = dst / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src / rel, target)
+            kept += 1
+    return kept, dropped
+
+
+def strip_edges(dst: Path, excludes: list[str]) -> int:
+    """Remove frontmatter list items / scalars that point into excluded paths."""
+    stripped = 0
+    for md in dst.rglob("*.md"):
+        text = md.read_text()
+        if not text.startswith("---\n"):
+            continue
+        end = text.find("\n---", 4)
+        if end < 0:
+            continue
+        fm, body = text[4:end], text[end:]
+        out, changed = [], False
+        current_key = None
+        for line in fm.splitlines():
+            key_m = re.match(r"^([A-Za-z_][\w-]*):", line)
+            if key_m:
+                current_key = key_m.group(1)
+                if current_key in SCALAR_EDGE_KEYS:
+                    val = line.split(":", 1)[1].strip()
+                    if val and excluded_uri(val, excludes):
+                        out.append(f"{current_key}: null")
+                        stripped += 1
+                        changed = True
+                        continue
+            elif current_key in EDGE_KEYS:
+                item = re.match(r"^\s+-\s+(.*)$", line)
+                if item and excluded_uri(item.group(1), excludes):
+                    stripped += 1
+                    changed = True
+                    continue
+            out.append(line)
+        if changed:
+            md.write_text("---\n" + "\n".join(out) + body)
+    return stripped
+
+
+def scan_banned(dst: Path, terms: list[str], redact: bool) -> list[tuple[str, int, str]]:
+    if not terms:
+        return []
+    pat = re.compile(r"\b(" + "|".join(re.escape(t) for t in terms) + r")\b", re.IGNORECASE)
+    hits = []
+    for f in list(dst.rglob("*.md")) + list(dst.rglob("*.yaml")):
+        try:
+            text = f.read_text()
+        except UnicodeDecodeError:
+            continue
+        if not pat.search(text):
+            continue
+        for i, line in enumerate(text.splitlines(), 1):
+            for m in pat.finditer(line):
+                hits.append((str(f.relative_to(dst)), i, m.group(0)))
+        if redact:
+            f.write_text(pat.sub("[redacted]", text))
+    return hits
+
+
+def run_kb(dst: Path, *args: str) -> None:
+    env = {**os.environ, "KB_DATA_DIR": str(dst)}
+    subprocess.run([str(ENGINE / "scripts" / "kb"), *args], env=env, check=True)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--out", default=str(Path(tempfile.gettempdir()) / "kb-demo-view"))
+    ap.add_argument("--redact", action="store_true", help="replace banned-term hits with [redacted]")
+    ap.add_argument("--launch", action="store_true", help="exec claude against the copy after building")
+    a = ap.parse_args()
+
+    root = kb_root()
+    out = Path(a.out).resolve()
+    if "kb-demo" not in out.name or out == root or root in out.parents or out in root.parents:
+        sys.exit(f"kb-demo-view: refusing target {out} (name must contain 'kb-demo', outside the live KB)")
+
+    excludes = load_exclude(root)
+    banfile = root / "_demo-banned-terms.txt"
+    if not banfile.exists():
+        banfile.write_text(
+            "# kb-demo-view: whole words that must not appear in the demo copy\n"
+            "# (candidate names, personal matters). One per line. Not the public-repo\n"
+            "# list in _banned-terms.txt, which bans company terms colleagues may see.\n")
+        print(f"created empty {banfile}, add candidate names etc.")
+    terms = read_list(banfile)
+
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True)
+
+    kept, dropped = copy_tree(root, out, excludes)
+    stripped = strip_edges(out, excludes)
+    (out / ".no-capture-queue").touch()
+    (out / ".no-autocommit").touch()
+    (out / ".DEMO-VIEW").write_text(f"filtered copy of {root}\nexcluded: {excludes}\n")
+
+    hits = scan_banned(out, terms, a.redact)
+
+    run_kb(out, "reindex-routes")
+    run_kb(out, "index")
+
+    print()
+    print(f"demo view: {out}")
+    print(f"  excluded paths : {', '.join(excludes)}")
+    print(f"  files kept     : {kept}   dropped: {dropped}   edges stripped: {stripped}")
+    if hits:
+        verb = "redacted" if a.redact else "FOUND"
+        print(f"  banned terms   : {len(hits)} hit(s) {verb}" + ("" if a.redact else "  <- fix the source or rerun with --redact"))
+        for f, i, t in hits[:40]:
+            print(f"      {f}:{i}: {t}")
+        if len(hits) > 40:
+            print(f"      ... {len(hits) - 40} more")
+    else:
+        print(f"  banned terms   : 0 hits ({len(terms)} terms scanned)")
+
+    settings = json.dumps({"env": {"KB_DATA_DIR": str(out)}})
+    cmd = ["claude", "--settings", settings]
+    print()
+    print("launch:")
+    print("  claude --settings '" + settings + "'")
+    print("verify inside the session:  ! echo $KB_DATA_DIR")
+
+    if hits and not a.redact:
+        return 1
+    if a.launch:
+        os.execvp(cmd[0], cmd)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

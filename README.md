@@ -117,7 +117,7 @@ Claude Code refuses to prefix-match allow rules against commands containing vari
 - `skills/kb-recall/` — proactive-recall skill (symlinked into `~/.claude/skills` by install).
 - `agents/kb-researcher.md` — cheap read-only extraction subagent (symlinked into `~/.claude/agents` by install; used by `/ask` and `kb-recall`).
 - `librarian/procedure-file.md` — canonical filing procedure shared by the slash command and the headless librarian script. Since v4 the LLM only distills a small JSON payload; `kb file` writes the leaf (machine-rendered transcript, schema validation, route bookkeeping, index refresh).
-- `scripts/kb` — the deterministic CLI (see below). `scripts/kb-mcp` — read-only MCP adapter over the CLI. `scripts/validate.py` — schema validator. `scripts/audit-topics.py` — topic normalization. `scripts/librarian` — headless maintenance (file / split / collapse / dedup / criticize / mine-recipes). `scripts/librarian-nightly` — the deterministic nightly job (launchd).
+- `scripts/kb` — the deterministic CLI (see below). `scripts/kb-mcp` — MCP adapter over the CLI (stdio, or loopback HTTP with optional writes for a team KB). `scripts/validate.py` — schema validator. `scripts/audit-topics.py` — topic normalization. `scripts/librarian` — headless maintenance (file / split / collapse / dedup / criticize / mine-recipes). `scripts/librarian-nightly` — the deterministic nightly job (launchd).
 - `hooks/session-start.sh` — tiered ambient payload (`kb ambient`). `hooks/auto-recall.sh` — semantic per-prompt recall (`kb recall`, registered by default). `hooks/capture-candidate.sh` — SessionEnd unfiled-session queue. `hooks/allow-kb-query.sh` — PreToolUse permission hook (see above). `hooks/pre-commit` — schema validator gate (kb-data). `hooks/pre-commit-no-leaks` — leak guard on the engine repo itself, scanning every commit against the private `$KB_DATA_DIR/_banned-terms.txt`. `hooks/normalize-topics.sh` — retired from per-session use (nightly `kb sync` covers it). `hooks/session-end.sh` — legacy unconditional auto-file (off by default).
 
 ## The `kb` CLI
@@ -135,7 +135,8 @@ kb sync             # reindex-routes + audit-topics --fix + index — run after 
 kb doctor           # broken refs, stale recipes, drift-risk, route drift, model hygiene
 kb problems scan|list|brief|resolve|drop   # the epistemic ledger
 kb eval [--recall] [--save-baseline]       # retrieval metrics over the _eval.yaml gold set
-kb serve --mcp      # read-only MCP server (stdio) — the KB for clients outside Claude Code
+kb serve --mcp      # MCP server (stdio) — the KB for clients outside Claude Code
+kb serve --http 127.0.0.1:7788 --write   # team KB over loopback HTTP, writes via kb_file
 ```
 
 Search is **hybrid**: BM25 (FTS5, porter-stemmed, phrase-aware) ∪ local static
@@ -193,14 +194,40 @@ contradicted fact and a duplicated fact look the same to an embedding — a key 
 - `kb doctor` adds `conflict` (same key, same day, different values), `stale-claim`,
   `weak-supersession` (an observed fact overridden by hearsay) and `unknown-subject`.
 
-## MCP: the KB outside Claude Code
+## MCP: the KB outside Claude Code, and the KB shared with a team
 
-`kb serve --mcp` (or `scripts/kb-mcp` directly) exposes the KB read-only over MCP
-stdio — point claude.ai desktop or any MCP client at it. The server is a ~100-line
-adapter that shells out to the same CLI (`kb_search`, `kb_show`, `kb_edges`,
-`kb_routes`, `kb_problems`), spawned per-client, no port, never writes. Its heavy
-SDK dependency lives in its own PEP 723 block, so normal `kb` invocations never
+`kb serve --mcp` (or `scripts/kb-mcp` directly) exposes the KB over MCP stdio —
+point claude.ai desktop or any MCP client at it. The server is a thin adapter that
+shells out to the same CLI (`kb_search`, `kb_show`, `kb_edges`, `kb_routes`,
+`kb_facts`, `kb_check`, `kb_problems`), spawned per-client, no port, read-only. Its
+heavy SDK dependency lives in its own PEP 723 block, so normal `kb` invocations never
 carry it.
+
+`kb serve --http 127.0.0.1:PORT [--write]` is the same server over streamable HTTP
+at `/mcp`, for a **team KB**: one process on a shared host with `KB_DATA_DIR` pointed
+at the shared tree, teammates reach it through an ssh tunnel and one line:
+
+```sh
+ssh -N -L PORT:127.0.0.1:PORT shared-host &
+claude mcp add --transport http -s user team-kb http://127.0.0.1:PORT/mcp
+```
+
+Two things make this more than a search endpoint:
+
+- **Instructions as ambient.** The server's MCP `instructions` carry what the KB is,
+  when to reach for it, and its folder map (rebuilt after every write), so a client
+  session starts with the same orientation a SessionStart hook gives locally. Claude
+  Code truncates instructions at 2,048 chars; the builder stays under 2,000 and drops
+  deep subfolders first.
+- **`--write` adds `kb_file` + `kb_filing_guide`.** The client's own model distills
+  the work (the guide says how), shows the payload, and on the user's yes calls
+  `kb_file`; the engine's deterministic writer assigns the id, validates (nothing is
+  written on failure), updates routes and the index. Writes are serialized (a lock in
+  the server and a `mkdir` lock in `kb file`), so concurrent clients never collide.
+
+Binding to anything but loopback is refused without `--insecure-bind`: on a shared
+network a routable bind is readable by everyone on it. Access control is whoever can
+open the tunnel, i.e. the host's ssh login.
 
 ## Filing stays a human decision — but a 2-second one
 
@@ -297,5 +324,6 @@ Validator output is one error per line, prefixed with the file's `kb:/` path. Ex
 - [x] Problem ledger (`kb:/problems/`, `kb problems`) + `/run-experiment` — the resolve loop
 - [x] Ambient v2 (tiered, cwd-aware) + semantic auto-recall (registered) + capture queue + `/file-this --bg`
 - [x] MCP server (`kb serve --mcp`) — the KB for clients outside Claude Code
+- [x] Team KB: `kb serve --http --write`, instructions-as-ambient, `kb_file` through the deterministic writer
 - [ ] link-fix mode (when path-rewrite bugs surface)
 - [ ] demo tape refresh (vhs) showing hybrid search + the resolve loop

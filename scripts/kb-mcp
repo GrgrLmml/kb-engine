@@ -1,25 +1,43 @@
 #!/usr/bin/env -S uv run --quiet --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.2"]
+# dependencies = ["mcp>=1.2", "uvicorn>=0.23", "pyyaml>=6"]
 # ///
-"""kb-mcp — read-only MCP server over the kb CLI (stdio only, no port).
+"""kb-mcp — MCP server over the kb CLI. stdio by default, HTTP on request.
 
 A deliberately thin adapter: every tool shells out to `scripts/kb`, so the CLI
-stays the single source of truth and this file stays ~100 lines. Point any MCP
-client (claude.ai desktop, other agents) at it:
+stays the single source of truth. It inherits `KB_DATA_DIR`, so one engine
+checkout can serve any KB: a personal one over stdio, or a shared team one over
+loopback HTTP that teammates reach through an ssh tunnel.
 
-    { "mcpServers": { "kb": {
-        "command": "uv",
-        "args": ["run", "--quiet", "<KB_ENGINE_DIR>/scripts/kb-mcp"],
-        "env": { "KB_DATA_DIR": "<your kb-data>" } } } }
+    kb-mcp                                   # stdio, read-only (claude.ai desktop etc.)
+    kb-mcp --http 127.0.0.1:7777             # HTTP at /mcp, read-only
+    kb-mcp --http 127.0.0.1:7777 --write     # + kb_file (writes go through `kb file`)
 
-The server is spawned per-client over stdio and never writes to the KB.
+Client side (Claude Code):
+    claude mcp add --transport http -s user team-kb http://127.0.0.1:7777/mcp
+
+The server's MCP `instructions` are the ambient payload a hook would otherwise
+inject at session start: what this KB is, when to reach for it, and its folder
+map. They are rebuilt after every write and every few minutes, so a new session
+sees the current tree. Writes are serialized (a lock here and in `kb file`).
+
+Binding to anything but loopback is refused without --insecure-bind: on a
+shared network, a routable bind is readable by everyone on it.
 """
 from __future__ import annotations
 
+import argparse
+import json
+import os
+import re
 import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
+
+import yaml
 
 try:  # mcp >= 2.0
     from mcp.server.mcpserver import MCPServer
@@ -28,20 +46,120 @@ except ImportError:  # mcp 1.x called the same thing FastMCP
 
 ENGINE = Path(__file__).resolve().parent
 KB = str(ENGINE / "kb")
-
-mcp = MCPServer(
-    "kb", instructions="Read-only access to a personal knowledge base: episodic "
-    "entries, reusable recipes, falsifiable models (theory layer), and the "
-    "problem ledger. Start with kb_search or kb_routes; kb_show prints a full "
-    "document; kb_edges walks typed links.")
+WRITE = False
+WRITE_LOCK = threading.Lock()
+REFRESH_EVERY = 300  # seconds
 
 
-def _run(*args: str) -> str:
-    r = subprocess.run(["uv", "run", "--quiet", KB, *args],
-                       capture_output=True, text=True, timeout=120)
+def kb_root() -> Path:
+    return Path(os.environ.get("KB_DATA_DIR") or str(ENGINE.parent / "kb-data")).resolve()
+
+
+def _run(*args: str, stdin: str | None = None, timeout: int = 120) -> str:
+    r = subprocess.run(["uv", "run", "--quiet", KB, *args], input=stdin,
+                       capture_output=True, text=True, timeout=timeout)
     if r.returncode not in (0, 1):  # 1 = "no hits"/findings, still useful output
-        return f"kb error (rc={r.returncode}): {r.stderr.strip()}"
+        return f"kb error (rc={r.returncode}): {(r.stderr or r.stdout).strip()}"
     return r.stdout
+
+
+# ------------------------------------------------------------ instructions
+
+def _root_purpose() -> str:
+    """The root _route.md purpose: what this KB is, in the owner's words."""
+    try:
+        text = (kb_root() / "_route.md").read_text()
+        end = text.find("\n---", 4)
+        fm = yaml.safe_load(text[4:end]) if text.startswith("---\n") and end > 0 else {}
+        return str((fm or {}).get("purpose") or "").strip() or "a knowledge base"
+    except Exception:
+        return "a knowledge base"
+
+
+INSTRUCTIONS_MAX = 2000  # Claude Code truncates MCP server instructions at 2,048 chars (measured 2026-10-09)
+
+
+def _folders() -> list[tuple[str, int, str, bool]]:
+    """(uri, entry count, purpose, purpose-was-truncated) per folder, from the FOLDER MAP block of `kb ambient`."""
+    out, on, rows = _run("ambient"), False, []
+    for line in out.splitlines():
+        if line.startswith("FOLDER MAP"):
+            on = True
+            continue
+        if on:
+            m = re.match(r"^  (kb:/\S*) \((\d+)\) — (.*)$", line)
+            if m:
+                purpose = m.group(3).strip()
+                rows.append((m.group(1), int(m.group(2)), purpose.rstrip("…").strip(), purpose.endswith("…")))
+            elif rows:
+                break
+    return rows
+
+
+def _folder_map(budget: int) -> str:
+    """One line per folder, purposes cut to fit `budget` chars. Deepest folders
+    are dropped first when even 40-char purposes would not fit."""
+    rows = [r for r in _folders() if r[0] != "kb:/"]
+    if not rows:
+        return "  (empty — nothing filed yet)"
+    total = len(rows)
+    while rows:
+        fixed = sum(len(f"  {u} ({n}) ") + 1 for u, n, _, _ in rows)
+        per = (budget - fixed) // len(rows)
+        if per >= 40 or len(rows) == 1:
+            break
+        deepest = max(r[0].count("/") for r in rows)
+        rows = [r for r in rows if r[0].count("/") < deepest] or rows[:-1]
+    per = max(per, 20)
+    lines = []
+    for u, n, purpose, was_cut in rows:
+        cut = purpose if len(purpose) <= per and not was_cut else purpose[: per - 1].rstrip() + "…"
+        lines.append(f"  {u} ({n}) {cut}")
+    if len(rows) < total:
+        lines.append(f"  (+{total - len(rows)} subfolders not shown: kb_routes)")
+    return "\n".join(lines)
+
+
+def build_instructions() -> str:
+    purpose = _root_purpose()
+    if len(purpose) > 240:
+        purpose = purpose[:239].rstrip() + "…"
+    head = f"TEAM KNOWLEDGE BASE. {purpose}\n"
+    body = (
+        "HOLDS entries (filed work: self-contained summary, decisions with reasons, dated claims about "
+        "current state), recipes (reusable procedures), models (falsifiable claims about our systems, "
+        "with evidence), problems (open conflicts + the settling experiment), facts (current value per "
+        "subject, with date and source).\n"
+        "USE IT before investigating a bug, incident, alert, config or review question about our "
+        "systems: kb_search first, kb_show the best hit, cite its id. 'What is X right now': kb_facts or "
+        "kb_check, never guess. What the team did, decided or hit before: kb_search, kb_routes. Not for "
+        "general programming knowledge.\n"
+    )
+    write = (
+        "FILE finished work others would hit again: read kb_filing_guide once, distill, show the payload, "
+        "call kb_file only after the user says yes. No secrets, no customer personal data, no raw transcripts.\n"
+        if WRITE else "This server is read-only.\n"
+    )
+    tail_hdr = "FOLDERS (count; kb_routes lists entries):\n"
+    budget = INSTRUCTIONS_MAX - len(head) - len(body) - len(write) - len(tail_hdr)
+    return head + body + write + tail_hdr + _folder_map(budget) + "\n"
+
+
+def refresh_instructions(server) -> None:
+    text = build_instructions()
+    low = getattr(server, "_lowlevel_server", None) or getattr(server, "_mcp_server", None)
+    if low is not None:
+        low.instructions = text
+    else:  # very old SDKs: best effort
+        try:
+            server.instructions = text
+        except Exception:
+            pass
+
+
+# ------------------------------------------------------------------ server
+
+mcp = MCPServer("kb", instructions="loading…")
 
 
 @mcp.tool()
@@ -92,9 +210,8 @@ def kb_facts(subject: str = "", scope: str = "", as_of: str = "", history: bool 
 def kb_check(text: str) -> str:
     """The KB's current claims on every subject the given text touches — compare
     the text against them to spot stale or wrong assertions."""
-    r = subprocess.run(["uv", "run", "--quiet", KB, "check"], input=text,
-                       capture_output=True, text=True, timeout=120)
-    return (r.stdout or "").strip() or "no current claims touch this text"
+    out = _run("check", stdin=text)
+    return out.strip() or "no current claims touch this text"
 
 
 @mcp.tool()
@@ -105,5 +222,119 @@ def kb_problems(status: str = "") -> str:
     return _run("problems", "list", *(["--status", status] if status else []))
 
 
+FILING_GUIDE = """\
+FILING GUIDE — how to turn finished work into one KB entry (then call kb_file).
+
+Division of labour: you judge (what this was, where it belongs, what was decided);
+the engine writes (id, timestamps, YAML, folder bookkeeping, schema validation, index).
+Never hand-write files. One entry per piece of work, filed when it is done, not during.
+
+Payload (JSON object), fields:
+  title             <= 70 chars, specific ("Batch queue hang: three-stamp triage", not "debugging").
+  folder            kb:/ URI of the folder whose purpose fits best (see the folder map in the server
+                    instructions or call kb_routes). New folder only if nothing fits: one level below
+                    an existing folder, plus folder_purpose (one good sentence, curated forever).
+  summary           two paragraphs, self-contained: what this was about and what came out of it.
+                    Someone reading only this must get the outcome. It is the main retrieval surface.
+  body              the narrative for a reader who wants the detail: what was observed, what was
+                    tried, what worked, key numbers, commands and queries that mattered, how it ended.
+                    300 to 1500 words. Plain markdown. No raw transcripts, no secrets, no credentials,
+                    no customer personal data. Name people by role unless they are the owner.
+  topics            3 to 6 lower-case tags (component, symptom, tool: "batch-service", "vector-db", "timeout",
+                    "datadog", "pr-review").
+  participants      who did the work, lower-case first names, author first.
+  decisions         every explicit decision as a self-contained line with its reason. Facts decided,
+                    not a to-do list.
+  claims            current-state facts the work established that could be false tomorrow because the
+                    world changed (a setting, threshold, routing rule, owner, which service does what).
+                    Each: {"subject": "area.thing.attribute", "value": "one line", "since": "YYYY-MM-DD",
+                    "kind": "observed|inferred|reported", "source": "url (optional)"}.
+                    Reuse existing subjects when one means the same thing (kb_facts with a prefix shows
+                    them). History goes in decisions, state goes in claims. 0 to 3 claims is normal.
+  open_questions    what was left dangling.
+  sources           external permalinks only (Jira, Slack, PR, dashboard, gs://). Nothing else.
+  recipe_candidate  true only if the work combined >= 3 tools or data sources AND reached a repeatable
+                    method you would run again. One-off investigations: false.
+
+Then: show the payload to the user, ask, and on yes call kb_file(payload_json=<the JSON>, author=<their
+name>). The result is FILED <path> with a report (claims that confirm or supersede earlier ones, same-topic
+models and recipes worth a look), or REFUSED with schema errors, in which case nothing was written: fix
+the payload and call again. Report the FILED id back in one line.
+"""
+
+
+def _write_tools() -> None:
+    @mcp.tool()
+    def kb_filing_guide() -> str:
+        """How to distill finished work into a kb_file payload: fields, sizes, what
+        belongs in summary vs body vs claims, and the ask-before-write rule."""
+        return FILING_GUIDE
+
+    @mcp.tool()
+    def kb_file(payload_json: str, author: str = "") -> str:
+        """Write ONE entry into the KB from a distilled JSON payload (see
+        kb_filing_guide). Required: title, folder (kb:/ URI), summary (>= 20 chars),
+        body. The engine assigns the id, validates against the schema (nothing is
+        written on failure), updates routes and the index, and reports claims that
+        confirm or supersede earlier ones. Show the payload and get the user's yes
+        before calling. author: the user's first name, becomes participants[0]."""
+        try:
+            meta = json.loads(payload_json)
+        except json.JSONDecodeError as e:
+            return f"REFUSED: payload is not valid JSON: {e}"
+        if not isinstance(meta, dict):
+            return "REFUSED: payload must be a JSON object"
+        if not str(meta.get("body") or "").strip():
+            return "REFUSED: payload needs a body (the narrative; see kb_filing_guide)"
+        if author:
+            parts = [str(p) for p in (meta.get("participants") or [])]
+            a = author.strip().lower()
+            meta["participants"] = [a] + [p for p in parts if p.lower() != a]
+        with WRITE_LOCK:
+            out = _run("file", "--jot", "--meta", "-", stdin=json.dumps(meta), timeout=300)
+            refresh_instructions(mcp)
+        lines = [l for l in out.splitlines() if not l.startswith("kb reindex-routes:")]
+        return "\n".join(lines).strip() or "kb file returned nothing"
+
+
+def _refresher() -> None:
+    while True:
+        time.sleep(REFRESH_EVERY)
+        try:
+            refresh_instructions(mcp)
+        except Exception as e:  # never kill the server over the ambient text
+            print(f"kb-mcp: instructions refresh failed: {e}", file=sys.stderr)
+
+
+def main() -> None:
+    global WRITE
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--http", metavar="HOST:PORT", help="serve streamable HTTP at /mcp instead of stdio")
+    ap.add_argument("--write", action="store_true", help="expose kb_file + kb_filing_guide")
+    ap.add_argument("--insecure-bind", action="store_true",
+                    help="allow --http on a non-loopback address (everyone on that network can read the KB)")
+    ap.add_argument("--mcp", action="store_true", help=argparse.SUPPRESS)  # legacy no-op
+    a = ap.parse_args()
+
+    root = kb_root()
+    if not (root / "_route.md").exists():
+        sys.exit(f"kb-mcp: KB_DATA_DIR has no _route.md: {root}")
+    WRITE = a.write
+    if WRITE:
+        _write_tools()
+    refresh_instructions(mcp)
+    threading.Thread(target=_refresher, daemon=True).start()
+
+    if not a.http:
+        mcp.run()
+        return
+    host, _, port = a.http.rpartition(":")
+    host = host or "127.0.0.1"
+    if host not in ("127.0.0.1", "localhost", "::1") and not a.insecure_bind:
+        sys.exit(f"kb-mcp: refusing to bind {host}: not loopback (pass --insecure-bind if you mean it)")
+    print(f"kb-mcp: {root} at http://{host}:{port}/mcp  write={'on' if WRITE else 'off'}", file=sys.stderr)
+    mcp.run(transport="streamable-http", host=host, port=int(port))
+
+
 if __name__ == "__main__":
-    mcp.run()
+    main()

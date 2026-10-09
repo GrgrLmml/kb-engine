@@ -44,9 +44,11 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -1112,6 +1114,7 @@ def cmd_file(args) -> int:
         sys.exit(f"kb file: folder must be a kb:/ URI, got {folder_uri!r}")
     folder = from_kb_uri(root, folder_uri)
     created_folder = False
+    purpose = ""
     if not folder.is_dir():
         purpose = str(meta.get("folder_purpose") or "").strip()
         if len(purpose) < 15:
@@ -1133,6 +1136,56 @@ def cmd_file(args) -> int:
         if tmeta["user_turns"] == 0:
             sys.exit(f"kb file: {transcript_path} rendered to zero user turns — wrong file?")
 
+    with write_lock(root):
+        return _file_locked(args, root, meta, folder, folder_uri, created_folder,
+                            purpose, owner, transcript_path, tmeta, body)
+
+
+class write_lock:
+    """mkdir-based lock so concurrent writers (two MCP clients, a hook and a
+    session) never pick the same id or interleave route/index refreshes.
+    Waits up to 90 s; a lock whose pid is dead is taken over."""
+
+    def __init__(self, root: Path, wait: float = 90.0):
+        self.dir = root / ".kb-write.lock"
+        self.wait = wait
+
+    def __enter__(self):
+        deadline = time.monotonic() + self.wait
+        while True:
+            try:
+                self.dir.mkdir()
+                (self.dir / "pid").write_text(str(os.getpid()))
+                return self
+            except FileExistsError:
+                try:
+                    pid = int((self.dir / "pid").read_text().strip() or 0)
+                except (OSError, ValueError):
+                    pid = 0
+                if pid and not _pid_alive(pid):
+                    shutil.rmtree(self.dir, ignore_errors=True)
+                    continue
+                if time.monotonic() > deadline:
+                    sys.exit(f"kb file: write lock {self.dir} held by pid {pid or '?'} for >{int(self.wait)}s")
+                time.sleep(0.2)
+
+    def __exit__(self, *exc):
+        shutil.rmtree(self.dir, ignore_errors=True)
+        return False
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _file_locked(args, root, meta, folder, folder_uri, created_folder,
+                 purpose, owner, transcript_path, tmeta, body) -> int:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     slug = slugify(str(meta.get("slug") or meta["title"]))
     con = open_db(root)
@@ -2454,8 +2507,8 @@ def _cwd_tokens(cwd: str) -> set[str]:
     return {t for t in toks if len(t) >= 3}
 
 
-def capture_queue_lines(root: Path, limit: int = 5) -> list[str]:
-    """Unfiled-session suggestions written by the SessionEnd capture hook."""
+def capture_queue_rows(root: Path, limit: int = 5) -> list[list[str]]:
+    """Unfiled-session suggestions written by the SessionEnd capture hook, newest first."""
     q = root / ".librarian" / "capture-queue.tsv"
     if not q.is_file():
         return []
@@ -2464,9 +2517,26 @@ def capture_queue_lines(root: Path, limit: int = 5) -> list[str]:
         parts = line.split("\t")
         if len(parts) >= 4 and 0 <= age_days(parts[0]) <= 14:
             rows.append(parts)
-    rows = rows[-limit:][::-1]  # newest first
-    return [f"  [{i + 1}] {r[0][:10]} \"{r[3][:80]}\" — transcript: {r[2]}"
-            for i, r in enumerate(rows)]
+    return rows[-limit:][::-1]
+
+
+def capture_queue_lines(root: Path, limit: int = 5) -> list[str]:
+    # no transcript paths here: they cost ~100 chars each in the ambient payload,
+    # `kb unfiled N` resolves them
+    return [f"  [{i + 1}] {r[0][:10]} \"{r[3][:80]}\""
+            for i, r in enumerate(capture_queue_rows(root, limit))]
+
+
+def cmd_unfiled(args) -> int:
+    rows = capture_queue_rows(kb_root())
+    if args.n is None:
+        for i, r in enumerate(rows):
+            print(f"[{i + 1}] {r[0][:10]} \"{r[3][:80]}\" — {r[2]}")
+        return 0
+    if not 1 <= args.n <= len(rows):
+        sys.exit(f"kb unfiled: no item #{args.n} (queue has {len(rows)})")
+    print(rows[args.n - 1][2])
+    return 0
 
 
 TIER_B_MAX = 12      # newest entries shown per matched folder
@@ -2495,6 +2565,7 @@ def cmd_ambient(args) -> int:
     if rec:
         out += ["", "recipe triggers (when_to_use):", *rec]
 
+    tier_b: list = []
     if args.cwd:
         toks = _cwd_tokens(args.cwd)
         # models/recipes/problems are already ambient via their Tier-A blocks
@@ -2507,13 +2578,10 @@ def cmd_ambient(args) -> int:
                     and f.split("/")[-1].lower() not in ("models", "recipes", "problems")]
         shown = (by_name + by_topic)[:TIER_B_FOLDERS]
         if shown:
-            out += ["", f"RELEVANT TO THIS REPO ({Path(args.cwd).name}) — newest entries:"]
+            tier_b = ["", f"RELEVANT TO THIS REPO ({Path(args.cwd).name}) — newest entries:"]
             for f in shown:
-                lines = sorted(entry_map[f], reverse=True)  # ids are date-prefixed
-                out.append(f"  {f}:")
-                out += lines[:TIER_B_MAX]
-                if len(lines) > TIER_B_MAX:
-                    out.append(f"    … {len(lines) - TIER_B_MAX} older — `kb routes --compact`")
+                tier_b.append(entry_map[f])  # placeholder, sized against the budget below
+    tier_b_at = len(out)
 
     brief = problems_brief_text(root)
     if brief:
@@ -2528,19 +2596,56 @@ def cmd_ambient(args) -> int:
             lines = digest.read_text().splitlines()
             cut = next((i for i, l in enumerate(lines)
                         if l.startswith("OPEN PROBLEMS")), len(lines))
-            slim = [l for l in lines[:cut] if l.strip()][:12]
-            out += ["", "LIBRARIAN DIGEST (overnight run):", *slim]
+            # "## section" detail lines collapse to a count, the ambient
+            # payload must stay under Claude Code's 10k-char hook cap
+            slim: list[str] = []
+            stamp = ""
+            for l in lines[:cut]:
+                if l.startswith("# librarian digest"):
+                    stamp = l.split("—")[-1].strip()
+                    continue
+                # no-news bullets cost bytes and carry nothing
+                if not l.strip() or re.search(r": (0 file|none scheduled|autosave disabled)", l):
+                    continue
+                if l.startswith("## "):
+                    slim.append([l[3:], 0])
+                elif isinstance(slim[-1] if slim else None, list):
+                    slim[-1][1] += 1
+                else:
+                    slim.append(l)
+            slim = [f"- {x[0]}: {x[1]} (`kb doctor`)" if isinstance(x, list) else x
+                    for x in slim][:12]
+            out += ["", f"LIBRARIAN DIGEST (overnight run {stamp}):", *slim]
 
     unfiled = capture_queue_lines(root)
     if unfiled:
-        out += ["", f"UNFILED SESSIONS ({len(unfiled)}) — say \"file #N\" to file one "
-                    f"in the background (scripts/librarian file --transcript <path>):",
+        out += ["", f"UNFILED SESSIONS ({len(unfiled)}) — say \"file #N\" to file one in the background "
+                    f"(scripts/librarian file --transcript \"$(kb unfiled N)\"):",
                 *unfiled]
+
+    # Tier B is the only elastic tier: fill it with what the budget leaves after
+    # every fixed section, newest entries first, fewer per folder as space runs out
+    if tier_b:
+        fixed = len("\n".join(out))
+        folders = [x for x in tier_b[2:]]
+        names = [f for f in shown]
+        for per in range(TIER_B_MAX, 0, -1):
+            block = tier_b[:2]
+            for f, ents in zip(names, folders):
+                lines = sorted(ents, reverse=True)  # ids are date-prefixed
+                block.append(f"  {f}:")
+                block += lines[:per]
+                if len(lines) > per:
+                    block.append(f"    … {len(lines) - per} older — `kb routes --compact`")
+            if not args.max_chars or fixed + len("\n".join(block)) + 1 <= args.max_chars:
+                out[tier_b_at:tier_b_at] = block
+                break
 
     text = "\n".join(out)
     print(text)
+    # stderr: the hook discards it, so it does not count against the 10k cap
     print(f"\nBASELINE: level=ambient routes={len(routes)} chars={len(text)} "
-          f"est_tokens={len(text) // 4}")
+          f"est_tokens={len(text) // 4}", file=sys.stderr)
     return 0
 
 
@@ -2683,7 +2788,14 @@ def cmd_serve(args) -> int:
     server = engine_dir() / "scripts" / "kb-mcp"
     if not server.exists():
         sys.exit(f"kb serve: missing {server}")
-    os.execvp("uv", ["uv", "run", "--quiet", str(server)])
+    extra = []
+    if args.http:
+        extra += ["--http", args.http]
+    if args.write:
+        extra.append("--write")
+    if args.insecure_bind:
+        extra.append("--insecure-bind")
+    os.execvp("uv", ["uv", "run", "--quiet", str(server), *extra])
 
 
 # ---------------------------------------------------------------------- main
@@ -2757,7 +2869,13 @@ def main() -> int:
 
     p = sub.add_parser("ambient", help="tiered SessionStart payload (folder map + cwd-relevant entries + deltas)")
     p.add_argument("--cwd", help="session working directory (enables Tier B relevance)")
+    p.add_argument("--max-chars", type=int, default=0,
+                   help="char budget; Tier B shrinks (or drops) to fit, fixed tiers are never cut")
     p.set_defaults(fn=cmd_ambient)
+
+    p = sub.add_parser("unfiled", help="list the unfiled-session queue, or print item N's transcript path")
+    p.add_argument("n", type=int, nargs="?")
+    p.set_defaults(fn=cmd_unfiled)
 
     p = sub.add_parser("recall", help="score a prompt (stdin) against the KB; print at most n relevant leaves")
     p.add_argument("-n", type=int, default=3)
@@ -2775,8 +2893,11 @@ def main() -> int:
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_edges)
 
-    p = sub.add_parser("serve", help="serve the KB read-only over MCP (stdio)")
-    p.add_argument("--mcp", action="store_true", help="(the only mode — explicit for clarity)")
+    p = sub.add_parser("serve", help="serve the KB over MCP: stdio (default) or loopback HTTP")
+    p.add_argument("--mcp", action="store_true", help="(stdio mode — explicit for clarity)")
+    p.add_argument("--http", metavar="HOST:PORT", help="streamable HTTP at /mcp, e.g. 127.0.0.1:7777")
+    p.add_argument("--write", action="store_true", help="also expose kb_file (writes go through `kb file`)")
+    p.add_argument("--insecure-bind", action="store_true", help="allow a non-loopback --http address")
     p.set_defaults(fn=cmd_serve)
 
     p = sub.add_parser("routes", help="emit the route layer + BASELINE metrics")
