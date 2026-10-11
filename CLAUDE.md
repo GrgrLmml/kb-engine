@@ -84,11 +84,12 @@ Run any of these in a Claude Code session once installed:
 - `skills/` — proactive skills (`kb-recall`), symlinked into `~/.claude/skills` by install.
 - `agents/` — subagent definitions (`kb-researcher`: cheap read-only transcript extraction), symlinked into `~/.claude/agents` by install.
 - `librarian/` — the canonical filing/split/collapse/dedup/extract-recipe/mine-recipes/theorize procedures.
-- `scripts/` — `kb` (deterministic CLI: search/show/edges/routes/sync/doctor/problems/eval/ambient/recall/serve), `kb-mcp` (MCP adapter over the CLI: stdio, or loopback HTTP with `--write` for a team KB), `validate.py` (schema), `audit-topics.py` (topic normalization), `librarian` (headless: file/split/collapse/dedup/criticize/mine-recipes), `librarian-nightly` (deterministic nightly job, run by launchd).
+- `scripts/` — `kb` (deterministic CLI: search/show/edges/routes/sync/doctor/problems/eval/ambient/recall/serve), `kb-mcp` (MCP adapter over the CLI: stdio, or loopback HTTP with `--write` for a team KB), `validate.py` (schema), `audit-topics.py` (topic normalization), `librarian` (headless: file/split/collapse/dedup/criticize/mine-recipes), `librarian-nightly` (deterministic nightly job, run by launchd / systemd), `coworker` (optional co-worker mode: routine-agent runner, timers, sync, Slack posting; see `docs/coworker.md`), `slack-agent` (cheap Slack watcher for the main session).
 - `hooks/` — `session-start.sh` (tiered ambient payload via `kb ambient`), `auto-recall.sh` (semantic per-prompt recall via `kb recall`, registered by default), `capture-candidate.sh` (SessionEnd: queues substantial unfiled sessions), `allow-kb-query.sh` (PreToolUse: auto-allows read-only kb queries), `pre-commit` (kb-data schema validator), `pre-commit-no-leaks` (ENGINE repo leak guard: blocks commits containing terms from the private `$KB_DATA_DIR/_banned-terms.txt` — this repo is public, KB content must never leak in), `normalize-topics.sh` (retired from per-session use — nightly `kb sync` covers it), `session-end.sh` (legacy unconditional auto-file, off by default).
 - `docs/schema.md` — the frontmatter contract (leaf entries, recipes, routes). Read it before editing KB files.
+- `docs/coworker.md` — co-worker mode: an always-on personal co-worker (`./install.sh --coworker`).
 - `docs/plan-day2.md` — the day-2 maturity plan (phases 1–3 shipped; phase 4 trigger-gated).
-- `templates/` — starter files for new entries, recipes, routes, and the topic/tools vocabularies.
+- `templates/` — starter files for new entries, recipes, routes, and the topic/tools vocabularies; `templates/coworker/` seeds a co-worker home.
 
 Recipes (`type: recipe`, under `kb:/recipes/`) are evergreen reusable procedures distilled from
 conversations — see `docs/schema.md`. The `tools:` field is normalized against `kb-data/_tools.yaml`.

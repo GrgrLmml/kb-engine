@@ -1,0 +1,870 @@
+#!/usr/bin/env python3
+"""coworker — run the KB as an always-on personal co-worker.
+
+The engine supplies the mechanics; your instance (agent prompts, facts prefix,
+schedule, Slack ids) lives in a private *co-worker home* ($COWORKER_HOME,
+default ~/coworker). See docs/coworker.md for the full runbook.
+
+Usage:
+  coworker init [HOME]                          scaffold a co-worker home
+  coworker run <agent> [slot] [--no-post] [--dry-run]
+                                                one routine-agent run (the runner pattern)
+  coworker schedule <agent|sync> <slot> <when> [--no-catch-up] [--dry-run] [--platform P]
+                                                write + enable a timer (a human runs this)
+  coworker daemon <name> [--dry-run] [--platform P] -- <cmd> [args...]
+                                                write + enable an always-on service
+  coworker unschedule <agent|name> [slot] | --all
+  coworker status                               installed units + recent runs
+  coworker sync [message]                       secret-checked commit + push of the home (and KB)
+  coworker post <channel|user-id> <text>        post to Slack, or DM a user id
+  coworker upload <channel-id> <file> [comment] upload a file (chart, PDF) to Slack
+
+<when>:  "07:30" daily · "Sun 21:30" / "Mon,Thu 09:00" weekly · "hourly" · "every 15m" / "every 6h"
+Times are COWORKER_TZ (coworker.env) on systemd; launchd always uses the machine's local time.
+
+Design rules this script enforces (docs/coworker.md has the why):
+  - the model only writes files in its own run folder; this runner files, posts and pushes
+  - the model never holds a token: headless runs get no MCP servers at all
+  - facts come from the KB (`kb facts <prefix>`), never from the prompt
+  - nothing is posted unless the agent wrote slack.txt; most runs should be quiet
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+ENGINE = Path(os.environ.get("KB_ENGINE_DIR") or Path(__file__).resolve().parent.parent)
+KB = ENGINE / "scripts" / "kb"
+TEMPLATES = ENGINE / "templates" / "coworker"
+FACTS_CAP = 60_000
+UNIT_PREFIX_LAUNCHD = "com.kb-engine"
+
+# Token shapes `sync` refuses to commit. Names only are printed, never the match.
+SECRET_PATTERNS = {
+    "slack token": r"xox[abprs]-[A-Za-z0-9-]{10,}",
+    "slack app token": r"xapp-[0-9]-[A-Za-z0-9-]{10,}",
+    "anthropic key": r"sk-ant-[A-Za-z0-9_-]{20,}",
+    "openai-style key": r"\bsk-[A-Za-z0-9]{32,}",
+    "stripe live key": r"\b[rs]k_live_[A-Za-z0-9]{16,}",
+    "aws access key": r"\bAKIA[0-9A-Z]{16}\b",
+    "github token": r"\b(gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,})",
+    "gitlab token": r"\bglpat-[A-Za-z0-9_-]{20,}",
+    "google api key": r"\bAIza[0-9A-Za-z_-]{35}\b",
+    "private key": r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
+}
+
+OUTPUT_CONTRACT = """
+# Output contract (enforced by the runner)
+
+You run headless, once, inside your own run folder (the current directory).
+You cannot post, file, email or schedule anything; the runner does that from
+the files you leave behind. Write ONLY inside the current directory.
+
+Required: `entry.json`, a JSON object:
+  {
+    "title":   "short, specific (becomes the KB entry title)",
+    "summary": "2-5 sentences: what you checked and what you found (>= 20 chars)",
+    "topics":  ["lowercase-kebab", ...],
+    "decisions": ["only if something was decided"],
+    "open_questions": ["what a human should look at"],
+    "sources": ["every URL you actually opened"],
+    "related": ["kb ids of entries you built on"],
+    "claims": [
+      {"subject": "area.thing.attribute", "value": "...", "since": "YYYY-MM-DD",
+       "kind": "observed|inferred|reported", "source": "URL or kb id",
+       "scope": {"key": "value"}}
+    ],
+    "body": "optional markdown report (defaults to the summary)"
+  }
+A run with nothing new still writes entry.json (title like "Scout: quiet").
+Claims are dated facts that update the shared KB: only state what a source you
+opened says, reuse existing subjects from KB FACTS when the thing is the same.
+
+Optional:
+  `slack.txt`  post this to the channel. Only when it matters; most runs stay
+               quiet. Short, specific, one suggested action, no em-dashes.
+  `chart.png`  attached to the post (only used together with slack.txt).
+  `seen.add`   one line per item you reported, so later runs skip it.
+
+Never invent facts. Every claim needs a source you opened.
+"""
+
+
+# ---------------------------------------------------------------- config
+
+def die(msg: str, code: int = 1):
+    print(f"coworker: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def home_dir() -> Path:
+    return Path(os.environ.get("COWORKER_HOME") or Path.home() / "coworker").expanduser()
+
+
+def load_env(home: Path) -> dict:
+    """coworker.env: shell-style KEY=VALUE lines (also `source`-able from bash)."""
+    cfg = {}
+    p = home / "coworker.env"
+    if p.is_file():
+        for line in p.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            try:
+                parts = shlex.split(v, comments=True)
+            except ValueError:
+                parts = [v]
+            cfg[k.strip()] = " ".join(parts)
+    return cfg
+
+
+def kb_data_dir() -> Path:
+    return Path(os.environ.get("KB_DATA_DIR") or ENGINE / "kb-data").expanduser()
+
+
+def parse_agent(home: Path, name: str) -> tuple[dict, str, Path]:
+    path = home / "agents" / f"{name}.md"
+    if not path.is_file():
+        die(f"no agent prompt at {path}")
+    text = path.read_text()
+    spec: dict = {}
+    body = text
+    m = re.match(r"^---\n(.*?)\n---\n?(.*)$", text, re.S)
+    if m:
+        body = m.group(2)
+        for line in m.group(1).splitlines():
+            if ":" in line and not line.startswith((" ", "\t", "#")):
+                k, v = line.split(":", 1)
+                spec[k.strip()] = v.strip().strip('"').strip("'")
+    return spec, body.strip(), path
+
+
+# ---------------------------------------------------------------- helpers
+
+def kb(*args: str, input: str | None = None, check: bool = False) -> subprocess.CompletedProcess:
+    r = subprocess.run([str(KB), *args], input=input, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        die(f"kb {' '.join(args)} failed: {r.stderr.strip() or r.stdout.strip()}")
+    return r
+
+
+def utc_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def now_line() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def tail(path: Path, n: int) -> str:
+    if not path.is_file():
+        return ""
+    return "\n".join(path.read_text(errors="replace").splitlines()[-n:])
+
+
+def known_subjects() -> set[str]:
+    r = kb("facts", "--json")
+    try:
+        return {row["subject"] for row in json.loads(r.stdout or "[]")}
+    except (json.JSONDecodeError, TypeError, KeyError):
+        return set()
+
+
+def ensure_kb_folder(uri: str, leaf_purpose: str) -> None:
+    """Create missing route levels one at a time (kb file creates only the last one)."""
+    root = kb_data_dir()
+    parts = [p for p in uri.removeprefix("kb:/").split("/") if p]
+    cur = root
+    for i, part in enumerate(parts):
+        cur = cur / part
+        if (cur / "_route.md").is_file():
+            continue
+        folder_uri = "kb:/" + "/".join(parts[: i + 1])
+        purpose = leaf_purpose if i == len(parts) - 1 else \
+            "Reports filed by the always-on co-worker's routine agents, one subfolder per agent."
+        title = part.replace("-", " ").title()
+        cur.mkdir(parents=True, exist_ok=True)
+        (cur / "_route.md").write_text(
+            f"---\ntype: route\nfolder: {folder_uri}\ntitle: {json.dumps(title)}\n"
+            f"purpose: {json.dumps(purpose)}\nlast_indexed: {now_line()}\ntopics: []\n"
+            f"subroutes: []\nentries: []\nrelated: []\n---\n\n# {title}\n")
+
+
+# ---------------------------------------------------------------- slack
+
+def slack_token(cfg: dict) -> str:
+    cmd = cfg.get("SLACK_TOKEN_CMD") or "claude mcp get slack-mcp"
+    cwd = Path(cfg.get("SLACK_MCP_CWD") or home_dir()).expanduser()
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                       cwd=cwd if cwd.is_dir() else None)
+    m = re.search(r"xox[bp]-[A-Za-z0-9-]+", r.stdout + r.stderr)
+    if not m:
+        die("no Slack token: register it once with `claude mcp add slack-mcp ...` "
+            "(see docs/coworker.md) or set SLACK_TOKEN_CMD in coworker.env")
+    return m.group(0)
+
+
+def slack_api(tok: str, method: str, data: dict | None = None, json_body: bool = True) -> dict:
+    url = f"https://slack.com/api/{method}"
+    headers = {"Authorization": f"Bearer {tok}"}
+    if json_body:
+        payload = json.dumps(data or {}).encode()
+        headers["Content-Type"] = "application/json; charset=utf-8"
+    else:
+        payload = urllib.parse.urlencode(data or {}).encode()
+    req = urllib.request.Request(url, data=payload, headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as r:
+        out = json.load(r)
+    if not out.get("ok"):
+        die(f"slack {method}: {out.get('error', 'unknown error')}")
+    return out
+
+
+def slack_post(cfg: dict, channel: str, text: str) -> str:
+    out = slack_api(slack_token(cfg), "chat.postMessage",
+                    {"channel": channel, "text": text, "unfurl_links": False})
+    return out.get("ts", "")
+
+
+def slack_upload(cfg: dict, channel: str, file: Path, comment: str = "") -> None:
+    tok = slack_token(cfg)
+    data = file.read_bytes()
+    up = slack_api(tok, "files.getUploadURLExternal",
+                   {"filename": file.name, "length": len(data)}, json_body=False)
+    req = urllib.request.Request(up["upload_url"], data=data, method="POST")
+    with urllib.request.urlopen(req, timeout=60):
+        pass
+    body = {"files": [{"id": up["file_id"], "title": file.name}], "channel_id": channel}
+    if comment:
+        body["initial_comment"] = comment
+    slack_api(tok, "files.completeUploadExternal", body)
+
+
+# ---------------------------------------------------------------- init
+
+def cmd_init(argv: list[str]) -> int:
+    home = Path(argv[0]).expanduser() if argv else home_dir()
+    home = home.resolve()
+    for d in ("agents", "state", "units"):
+        (home / d).mkdir(parents=True, exist_ok=True)
+    copies = {
+        "coworker.env": "coworker.env.template",
+        ".gitignore": "gitignore.template",
+        "agents/_brief.md": "_brief.md",
+        "agents/example-scout.md": "example-scout.md",
+    }
+    for dst, src in copies.items():
+        target = home / dst
+        if target.exists():
+            print(f"  kept     {target}")
+        else:
+            shutil.copy(TEMPLATES / src, target)
+            print(f"  created  {target}")
+    if not (home / ".git").exists():
+        subprocess.run(["git", "init", "-q"], cwd=home)
+        print(f"  git init {home}")
+    print(f"\nco-worker home: {home}")
+    print("next: edit coworker.env, then `coworker run example-scout --no-post` (docs/coworker.md)")
+    return 0
+
+
+# ---------------------------------------------------------------- run
+
+def build_context(home: Path, cfg: dict, spec: dict, agent: str, slot: str, state: Path) -> str:
+    now = datetime.now().astimezone()
+    parts = [f"NOW: {now:%Y-%m-%d %H:%M %Z} ({datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC), "
+             f"{now:%A}. Agent: {agent}. Slot: {slot}."]
+
+    prefixes = (spec.get("facts") or cfg.get("FACTS_PREFIX") or "").split()
+    facts = []
+    for p in prefixes:
+        r = kb("facts", p)
+        if r.stdout.strip():
+            facts.append(r.stdout.strip())
+    if facts:
+        blob = "\n\n".join(facts)
+        if len(blob) > FACTS_CAP:
+            blob = blob[:FACTS_CAP] + "\n[... truncated; use `kb facts <subject>` for more]"
+        parts.append("KB FACTS (current claims; the KB wins over your own memory):\n" + blob)
+    else:
+        parts.append("KB FACTS: none configured (set `facts:` in the agent or FACTS_PREFIX).")
+
+    n = int(spec.get("context_runs") or 3)
+    prev = sorted((state / "runs").glob("*/entry.json"))[-n:] if n else []
+    if prev:
+        lines = []
+        for p in prev:
+            try:
+                e = json.loads(p.read_text())
+                lines.append(f"- {p.parent.name}: {e.get('title', '')}: {e.get('summary', '')}")
+            except (json.JSONDecodeError, OSError):
+                continue
+        if lines:
+            parts.append("YOUR PREVIOUS RUNS (do not repeat them):\n" + "\n".join(lines))
+    seen = tail(state / "seen.tsv", 200)
+    if seen:
+        parts.append("ALREADY REPORTED (seen.tsv; skip these):\n" + seen)
+    posted = tail(state / "posted.log", 10)
+    if posted:
+        parts.append("RECENTLY POSTED TO SLACK:\n" + posted)
+    parts.append("Do the job described in your instructions now, then write the output files.")
+    return "\n\n".join(parts)
+
+
+def cmd_run(argv: list[str]) -> int:
+    flags = {a for a in argv if a.startswith("--")}
+    pos = [a for a in argv if not a.startswith("--")]
+    if not pos:
+        die("usage: coworker run <agent> [slot] [--no-post] [--dry-run]")
+    agent, slot = pos[0], (pos[1] if len(pos) > 1 else "default")
+    no_post = "--no-post" in flags or "--dry-run" in flags
+    dry = "--dry-run" in flags
+
+    home = home_dir()
+    cfg = load_env(home)
+    spec, body, _ = parse_agent(home, agent)
+    brief = (home / "agents" / "_brief.md")
+    state = home / "state" / agent
+    run_dir = state / "runs" / f"{utc_stamp()}-{slot}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    runs_log = state / "runs.log"
+
+    def log(status: str, detail: str = "") -> None:
+        with runs_log.open("a") as f:
+            f.write(f"{now_line()}\t{slot}\t{status}\t{detail}\n")
+        print(f"coworker run {agent} {slot}: {status} {detail}".rstrip())
+
+    sysprompt = run_dir / "system.md"
+    sysprompt.write_text(
+        (brief.read_text().strip() + "\n\n" if brief.is_file() else "") + body + "\n" + OUTPUT_CONTRACT)
+    (run_dir / "mcp.json").write_text('{"mcpServers": {}}\n')
+    prompt = build_context(home, cfg, spec, agent, slot, state)
+    (run_dir / "prompt.txt").write_text(prompt)
+
+    kbq = str(KB)
+    tools = ["Read", "Write", "Edit", "Glob", "Grep",
+             f"Bash({kbq} facts:*)", f"Bash({kbq} search:*)", f"Bash({kbq} show:*)"]
+    tools += [t.strip() for t in (spec.get("tools") or "").split(",") if t.strip()]
+    model = spec.get("model") or cfg.get("DEFAULT_MODEL") or "sonnet"
+    budget = int(spec.get("budget") or 900)
+    escalate = (spec.get("escalate") or "").split()
+    before = known_subjects() if escalate else set()
+
+    # --setting-sources local: the run must not inherit the owner's interactive
+    # setup (user hooks would fire on every headless run, and a user-level
+    # env.KB_DATA_DIR would silently override the one this runner was given).
+    cmd = ["claude", "-p", "--model", model, "--output-format", "text",
+           "--setting-sources", "local",
+           "--append-system-prompt-file", str(sysprompt),
+           "--strict-mcp-config", "--mcp-config", str(run_dir / "mcp.json"),
+           "--allowedTools", ",".join(tools)]
+    t0 = time.monotonic()
+    try:
+        with (run_dir / "claude.out").open("w") as out, (run_dir / "claude.err").open("w") as err:
+            r = subprocess.run(cmd, input=prompt, stdout=out, stderr=err, text=True,
+                               cwd=run_dir, timeout=budget)
+    except subprocess.TimeoutExpired:
+        log("TIMEOUT", f"after {budget}s; run folder {run_dir}")
+        return 1
+    except FileNotFoundError:
+        log("FAILED", "claude CLI not on PATH")
+        return 1
+    secs = int(time.monotonic() - t0)
+    if r.returncode != 0:
+        log("FAILED", f"claude exit {r.returncode} after {secs}s; see {run_dir}/claude.err")
+        return 1
+
+    try:
+        entry = json.loads((run_dir / "entry.json").read_text())
+        assert isinstance(entry, dict)
+    except (OSError, json.JSONDecodeError, AssertionError):
+        log("INVALID", f"no valid entry.json after {secs}s; see {run_dir}")
+        return 1
+    if not entry.get("title") or len(str(entry.get("summary") or "").strip()) < 20:
+        log("INVALID", f"entry.json needs title + summary (>= 20 chars); see {run_dir}")
+        return 1
+
+    folder = spec.get("folder") or f"{cfg.get('KB_FOLDER') or 'kb:/coworker'}/{agent}"
+    meta = {k: entry[k] for k in ("title", "summary", "topics", "decisions", "open_questions",
+                                  "sources", "claims", "body", "related") if entry.get(k)}
+    # The schema takes only URLs in sources[] and kb:/ paths in related[]; models
+    # cite kb ids in either. Route each reference to where it belongs; drop the rest.
+    sources, related = [], []
+    for ref in [*(entry.get("sources") or []), *(entry.get("related") or [])]:
+        ref = str(ref).strip()
+        if re.match(r"^(https?|gs)://", ref):
+            sources.append(ref)
+            continue
+        r = kb("show", "--path", ref)
+        if r.returncode == 0 and r.stdout.strip():
+            p = Path(r.stdout.strip().splitlines()[0]).resolve()
+            uri = "kb:/" + str(p.relative_to(kb_data_dir().resolve()))
+            if uri not in related:
+                related.append(uri)
+    meta.pop("sources", None)
+    meta.pop("related", None)
+    if sources:
+        meta["sources"] = list(dict.fromkeys(sources))
+    if related:
+        meta["related"] = related
+    meta["folder"] = folder
+    meta["participants"] = [agent]
+    (run_dir / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False))
+
+    seen_add = run_dir / "seen.add"
+    if seen_add.is_file() and not dry:
+        with (state / "seen.tsv").open("a") as f:
+            for line in seen_add.read_text().splitlines():
+                if line.strip():
+                    f.write(f"{now_line()[:10]}\t{line.strip()}\n")
+
+    if dry:
+        print(json.dumps(meta, indent=2, ensure_ascii=False))
+        log("DRY-RUN", entry["title"])
+        return 0
+
+    purpose = spec.get("folder_purpose") or \
+        f"Reports filed by the {agent} routine agent. {spec.get('description', '')}".strip()
+    ensure_kb_folder(folder, purpose)
+    fr = kb("file", "--jot", "--meta", str(run_dir / "meta.json"))
+    if fr.returncode != 0:
+        why = (fr.stderr or fr.stdout).strip().splitlines()
+        log("FILE-FAILED", f"{why[-1] if why else 'kb file failed'}; see {run_dir}")
+        return 1
+    m = re.search(r"^\s*id:\s*(\S+)", fr.stdout, re.M)
+    kb_id = m.group(1) if m else "?"
+
+    posted = "quiet"
+    slack_txt = run_dir / "slack.txt"
+    channel = spec.get("channel") or cfg.get("SLACK_DEFAULT_CHANNEL") or ""
+    if slack_txt.is_file() and slack_txt.read_text().strip():
+        text = slack_txt.read_text().strip()
+        if no_post:
+            posted = "would post (--no-post)"
+        elif not channel:
+            posted = "not posted: no channel configured"
+        else:
+            chart = run_dir / "chart.png"
+            if chart.is_file():
+                slack_upload(cfg, channel, chart, text)
+            else:
+                slack_post(cfg, channel, text)
+            with (state / "posted.log").open("a") as f:
+                f.write(f"{now_line()}\t{slot}\t{text[:300].replace(chr(10), ' ')}\n")
+            posted = f"posted to {channel}"
+
+    # Deterministic escalation: a claim on an entity the KB did not know before
+    # this run (e.g. escalate: competitor.) DMs the owner. No model involved.
+    if escalate:
+        new = []
+        for c in entry.get("claims") or []:
+            subj = str(c.get("subject") or "").lower()
+            for pre in escalate:
+                if subj.startswith(pre):
+                    entity = pre + subj[len(pre):].split(".")[0]
+                    if not any(s == entity or s.startswith(entity + ".") for s in before) \
+                            and entity not in [e for e, _ in new]:
+                        new.append((entity, str(c.get("value", ""))[:200]))
+        owner = cfg.get("SLACK_OWNER_ID")
+        for entity, value in new:
+            msg = f"New in the KB: {entity}: {value} ({agent} {slot}, {kb_id})"
+            if no_post or not owner:
+                print(f"  escalation (not sent): {msg}")
+            else:
+                slack_post(cfg, owner, msg)
+
+    log("OK", f"{secs}s {kb_id} {posted}: {entry['title']}")
+    if cfg.get("SYNC_AFTER_RUN", "1") != "0":
+        do_sync(home, cfg, f"{agent} {slot}: {entry['title']}")
+    return 0
+
+
+# ---------------------------------------------------------------- sync
+
+class Lock:
+    def __init__(self, path: Path, wait: float = 120):
+        self.path, self.wait = path, wait
+
+    def __enter__(self):
+        deadline = time.monotonic() + self.wait
+        while True:
+            try:
+                self.path.mkdir(parents=True)
+                (self.path / "pid").write_text(str(os.getpid()))
+                return self
+            except FileExistsError:
+                try:
+                    pid = int((self.path / "pid").read_text().strip() or 0)
+                    os.kill(pid, 0)
+                except (OSError, ValueError):
+                    shutil.rmtree(self.path, ignore_errors=True)
+                    continue
+                if time.monotonic() > deadline:
+                    die(f"lock {self.path} held by pid {pid}")
+                time.sleep(0.5)
+
+    def __exit__(self, *exc):
+        shutil.rmtree(self.path, ignore_errors=True)
+        return False
+
+
+def git(repo: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+
+
+def secret_hits(repo: Path) -> list[str]:
+    diff = git(repo, "diff", "--cached", "-U0", "--no-color").stdout
+    hits, current = [], "?"
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            current = line[6:] if line.startswith("+++ b/") else line[4:]
+        elif line.startswith("+") and not line.startswith("+++"):
+            for name, pat in SECRET_PATTERNS.items():
+                if re.search(pat, line):
+                    hits.append(f"{current}: {name}")
+    return sorted(set(hits))
+
+
+def do_sync(home: Path, cfg: dict, message: str) -> int:
+    repos = []
+    if (home / ".git").exists():
+        repos.append(home)
+    kbd = kb_data_dir().resolve()
+    inside = str(kbd).startswith(str(home.resolve()) + os.sep)
+    if not inside and (kbd / ".git").exists() and not (kbd / ".no-autocommit").exists():
+        repos.append(kbd)
+    if not repos:
+        print("coworker sync: nothing to sync (home is not a git repo)")
+        return 0
+    rc = 0
+    with Lock(home / "state" / ".sync.lock"):
+        for repo in repos:
+            git(repo, "add", "-A")
+            if git(repo, "diff", "--cached", "--quiet").returncode == 0:
+                continue
+            hits = secret_hits(repo)
+            if hits:
+                git(repo, "reset", "-q")
+                print(f"coworker sync: REFUSED in {repo}: staged changes look like secrets:",
+                      file=sys.stderr)
+                for h in hits:
+                    print(f"  {h}", file=sys.stderr)
+                rc = 1
+                continue
+            c = git(repo, "commit", "-q", "-m", message)
+            if c.returncode != 0:
+                print(f"coworker sync: commit failed in {repo}: {c.stderr.strip()}", file=sys.stderr)
+                rc = 1
+                continue
+            print(f"coworker sync: committed {repo.name}: {message}")
+            if cfg.get("SYNC_PUSH", "1") != "0" and \
+                    git(repo, "rev-parse", "--abbrev-ref", "@{u}").returncode == 0:
+                p = git(repo, "push", "-q")
+                if p.returncode != 0:
+                    print(f"coworker sync: push failed in {repo}: {p.stderr.strip()}", file=sys.stderr)
+                    rc = 1
+    return rc
+
+
+# ---------------------------------------------------------------- scheduling
+
+def platform_of(argv: list[str]) -> str:
+    if "--platform" in argv:
+        return argv[argv.index("--platform") + 1]
+    return "launchd" if sys.platform == "darwin" else "systemd"
+
+
+DAYS = {"mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6, "sun": 0}
+
+
+def parse_when(when: str) -> dict:
+    w = when.strip().lower()
+    if w == "hourly":
+        return {"kind": "interval", "seconds": 3600, "oncal": "hourly"}
+    m = re.fullmatch(r"every\s+(\d+)\s*([mh])", w)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        oncal = f"*:0/{n}" if unit == "m" else f"0/{n}:00"
+        return {"kind": "interval", "seconds": n * (60 if unit == "m" else 3600), "oncal": oncal}
+    m = re.fullmatch(r"(?:([a-z,]+)\s+)?(\d{1,2}):(\d{2})", w)
+    if m:
+        days = [d for d in (m.group(1) or "").split(",") if d]
+        if any(d[:3] not in DAYS for d in days):
+            die(f"unknown weekday in {when!r}")
+        return {"kind": "calendar", "days": [d[:3] for d in days],
+                "hour": int(m.group(2)), "minute": int(m.group(3))}
+    die(f"cannot parse <when> {when!r} (try 07:30, 'Sun 21:30', hourly, 'every 15m')")
+
+
+def unit_path_env(home: Path) -> dict:
+    dirs = []
+    for tool in ("claude", "uv", "git", "python3", "node"):
+        p = shutil.which(tool)
+        if p and str(Path(p).parent) not in dirs:
+            dirs.append(str(Path(p).parent))
+    dirs += [d for d in ("/usr/local/bin", "/usr/bin", "/bin") if d not in dirs]
+    return {"PATH": ":".join(dirs), "KB_ENGINE_DIR": str(ENGINE),
+            "KB_DATA_DIR": str(kb_data_dir()), "COWORKER_HOME": str(home), "HOME": str(Path.home())}
+
+
+def systemd_units(name: str, desc: str, cmd: list[str], env: dict, home: Path,
+                  when: dict | None, catch_up: bool, cfg: dict, timeout: int) -> dict[str, str]:
+    envl = "\n".join(f"Environment=\"{k}={v}\"" for k, v in env.items())
+    execs = " ".join(shlex.quote(c) for c in cmd)
+    if when is None:
+        return {f"{name}.service":
+                f"[Unit]\nDescription={desc}\nAfter=network-online.target\n\n"
+                f"[Service]\nType=simple\nWorkingDirectory={home}\n{envl}\nExecStart={execs}\n"
+                f"Restart=on-failure\nRestartSec=30\n\n[Install]\nWantedBy=default.target\n"}
+    if when["kind"] == "interval":
+        oncal = when["oncal"]
+    else:
+        days = ",".join(d.capitalize() for d in when["days"])
+        tz = cfg.get("COWORKER_TZ", "")
+        oncal = f"{days + ' ' if days else ''}*-*-* {when['hour']:02d}:{when['minute']:02d}:00" + \
+                (f" {tz}" if tz else "")
+    return {
+        f"{name}.service":
+            f"[Unit]\nDescription={desc}\n\n[Service]\nType=oneshot\nWorkingDirectory={home}\n"
+            f"{envl}\nExecStart={execs}\nTimeoutStartSec={timeout}\n",
+        f"{name}.timer":
+            f"[Unit]\nDescription={desc}\n\n[Timer]\nOnCalendar={oncal}\n"
+            f"Persistent={'true' if catch_up else 'false'}\n\n[Install]\nWantedBy=timers.target\n",
+    }
+
+
+def launchd_plist(label: str, cmd: list[str], env: dict, home: Path,
+                  when: dict | None, logfile: Path) -> str:
+    def s(x):
+        return x.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    args = "".join(f"\n    <string>{s(c)}</string>" for c in cmd)
+    envx = "".join(f"\n    <key>{k}</key><string>{s(v)}</string>" for k, v in env.items())
+    if when is None:
+        sched = "  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n"
+    elif when["kind"] == "interval":
+        sched = f"  <key>StartInterval</key><integer>{when['seconds']}</integer>\n"
+    else:
+        hm = f"<key>Hour</key><integer>{when['hour']}</integer><key>Minute</key><integer>{when['minute']}</integer>"
+        if when["days"]:
+            items = "".join(f"\n    <dict><key>Weekday</key><integer>{DAYS[d]}</integer>{hm}</dict>"
+                            for d in when["days"])
+            sched = f"  <key>StartCalendarInterval</key>\n  <array>{items}\n  </array>\n"
+        else:
+            sched = f"  <key>StartCalendarInterval</key>\n  <dict>{hm}</dict>\n"
+    return ('<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+            '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict>\n'
+            f"  <key>Label</key><string>{s(label)}</string>\n"
+            f"  <key>ProgramArguments</key>\n  <array>{args}\n  </array>\n"
+            f"  <key>EnvironmentVariables</key>\n  <dict>{envx}\n  </dict>\n"
+            f"  <key>WorkingDirectory</key><string>{s(str(home))}</string>\n{sched}"
+            f"  <key>StandardOutPath</key><string>{s(str(logfile))}</string>\n"
+            f"  <key>StandardErrorPath</key><string>{s(str(logfile))}</string>\n"
+            "</dict>\n</plist>\n")
+
+
+def system_unit_dir(platform: str) -> Path:
+    return Path.home() / (".config/systemd/user" if platform == "systemd" else "Library/LaunchAgents")
+
+
+def install_units(platform: str, base: str, desc: str, cmd: list[str], when: dict | None,
+                  catch_up: bool, dry: bool, timeout: int = 1800) -> int:
+    home = home_dir()
+    cfg = load_env(home)
+    env = unit_path_env(home)
+    mirror = home / "units" / platform
+    if platform == "systemd":
+        files = systemd_units(base, desc, cmd, env, home, when, catch_up, cfg, timeout)
+        enable = f"{base}.service" if when is None else f"{base}.timer"
+    else:
+        label = f"{UNIT_PREFIX_LAUNCHD}.{base}"
+        logf = home / "state" / "launchd" / f"{base}.log"
+        files = {f"{label}.plist": launchd_plist(label, cmd, env, home, when, logf)}
+        if when and when["kind"] == "calendar" and cfg.get("COWORKER_TZ"):
+            print(f"note: launchd uses the machine's local time; COWORKER_TZ={cfg['COWORKER_TZ']} is ignored")
+    if dry:
+        for fn, body in files.items():
+            print(f"# --- {fn}\n{body}")
+        return 0
+    mirror.mkdir(parents=True, exist_ok=True)
+    target = system_unit_dir(platform)
+    target.mkdir(parents=True, exist_ok=True)
+    for fn, body in files.items():
+        (mirror / fn).write_text(body)
+        (target / fn).write_text(body)
+        print(f"  wrote {target / fn}")
+    if platform == "systemd":
+        subprocess.run(["systemctl", "--user", "daemon-reload"])
+        r = subprocess.run(["systemctl", "--user", "enable", "--now", enable])
+        if r.returncode != 0:
+            die(f"systemctl --user enable --now {enable} failed")
+        print(f"  enabled {enable}  (check: systemctl --user list-timers)")
+    else:
+        (home / "state" / "launchd").mkdir(parents=True, exist_ok=True)
+        plist = target / next(iter(files))
+        subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
+        r = subprocess.run(["launchctl", "load", str(plist)])
+        if r.returncode != 0:
+            die(f"launchctl load {plist} failed")
+        print(f"  loaded {plist.stem}  (check: launchctl list | grep {UNIT_PREFIX_LAUNCHD})")
+    return 0
+
+
+def unit_base(cfg: dict, *parts: str) -> str:
+    return "-".join([cfg.get("COWORKER_NAME") or "coworker", *parts])
+
+
+def cmd_schedule(argv: list[str]) -> int:
+    pos = [a for i, a in enumerate(argv) if not a.startswith("--") and
+           (i == 0 or argv[i - 1] != "--platform")]
+    if len(pos) < 3:
+        die("usage: coworker schedule <agent|sync> <slot> <when> [--no-catch-up] [--dry-run]")
+    agent, slot, when_s = pos[0], pos[1], " ".join(pos[2:])
+    home = home_dir()
+    cfg = load_env(home)
+    when = parse_when(when_s)
+    me = str(Path(__file__).resolve())
+    if agent == "sync":
+        cmd, timeout = [me, "sync", "scheduled sync"], 600
+    else:
+        spec, _, _ = parse_agent(home, agent)
+        cmd, timeout = [me, "run", agent, slot], int(spec.get("budget") or 900) + 300
+    return install_units(platform_of(argv), unit_base(cfg, agent, slot),
+                         f"co-worker: {agent} {slot} ({when_s})", cmd, when,
+                         catch_up="--no-catch-up" not in argv, dry="--dry-run" in argv,
+                         timeout=timeout)
+
+
+def cmd_daemon(argv: list[str]) -> int:
+    if "--" not in argv:
+        die("usage: coworker daemon <name> [--dry-run] [--platform P] -- <cmd> [args...]")
+    head, cmd = argv[: argv.index("--")], argv[argv.index("--") + 1:]
+    pos = [a for i, a in enumerate(head) if not a.startswith("--") and
+           (i == 0 or head[i - 1] != "--platform")]
+    if not pos or not cmd:
+        die("usage: coworker daemon <name> [--dry-run] [--platform P] -- <cmd> [args...]")
+    cfg = load_env(home_dir())
+    return install_units(platform_of(head), unit_base(cfg, pos[0]), f"co-worker daemon: {pos[0]}",
+                         cmd, None, catch_up=True, dry="--dry-run" in head)
+
+
+def unit_stem(platform: str, path: Path) -> str:
+    """systemd 'cw-scout-am.timer' -> 'cw-scout-am'; launchd 'com.kb-engine.cw-scout-am.plist' -> same."""
+    name = path.name.rsplit(".", 1)[0]
+    return name.removeprefix(UNIT_PREFIX_LAUNCHD + ".") if platform == "launchd" else name
+
+
+def installed_units(platform: str, match) -> list[Path]:
+    d = system_unit_dir(platform)
+    if not d.is_dir():
+        return []
+    return sorted(p for p in d.iterdir()
+                  if p.suffix in (".service", ".timer", ".plist") and match(unit_stem(platform, p)))
+
+
+def cmd_unschedule(argv: list[str]) -> int:
+    home = home_dir()
+    cfg = load_env(home)
+    platform = platform_of(argv)
+    pos = [a for i, a in enumerate(argv) if not a.startswith("--") and
+           (i == 0 or argv[i - 1] != "--platform")]
+    if "--all" in argv:
+        everything = unit_base(cfg) + "-"
+        match = lambda s: s.startswith(everything)
+    elif len(pos) > 1:
+        exact = unit_base(cfg, pos[0], pos[1])
+        match = lambda s: s == exact
+    elif pos:
+        base = unit_base(cfg, pos[0])
+        match = lambda s: s == base or s.startswith(base + "-")
+    else:
+        die("usage: coworker unschedule <agent|name> [slot] | --all")
+    units = installed_units(platform, match)
+    if not units:
+        print("nothing installed matches")
+        return 0
+    for u in units:
+        if platform == "systemd":
+            if u.suffix in (".timer", ".service"):
+                subprocess.run(["systemctl", "--user", "disable", "--now", u.name], capture_output=True)
+        else:
+            subprocess.run(["launchctl", "unload", str(u)], capture_output=True)
+        u.unlink()
+        m = home / "units" / platform / u.name
+        if m.exists():
+            m.unlink()
+        print(f"  removed {u.name}")
+    if platform == "systemd":
+        subprocess.run(["systemctl", "--user", "daemon-reload"])
+    return 0
+
+
+def cmd_status(argv: list[str]) -> int:
+    home = home_dir()
+    cfg = load_env(home)
+    platform = platform_of(argv)
+    print(f"home: {home}\nkb-data: {kb_data_dir()}\nplatform: {platform}\n")
+    prefix = unit_base(cfg) + "-"
+    units = installed_units(platform, lambda s: s.startswith(prefix))
+    print("installed units:" if units else "installed units: none")
+    for u in units:
+        print(f"  {u.name}")
+    if platform == "systemd" and units:
+        subprocess.run(["systemctl", "--user", "list-timers", f"{unit_base(cfg)}-*", "--no-pager"])
+    print()
+    for log in sorted((home / "state").glob("*/runs.log")):
+        print(f"{log.parent.name}:")
+        for line in tail(log, 3).splitlines():
+            print(f"  {line}")
+    return 0
+
+
+# ---------------------------------------------------------------- main
+
+def main() -> int:
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    cmd, argv = sys.argv[1], sys.argv[2:]
+    if cmd == "init":
+        return cmd_init(argv)
+    if cmd == "run":
+        return cmd_run(argv)
+    if cmd == "schedule":
+        return cmd_schedule(argv)
+    if cmd == "daemon":
+        return cmd_daemon(argv)
+    if cmd == "unschedule":
+        return cmd_unschedule(argv)
+    if cmd == "status":
+        return cmd_status(argv)
+    if cmd == "sync":
+        home = home_dir()
+        return do_sync(home, load_env(home), " ".join(argv) or "coworker sync")
+    if cmd == "post":
+        if len(argv) < 2:
+            die("usage: coworker post <channel|user-id> <text>")
+        print(slack_post(load_env(home_dir()), argv[0], " ".join(argv[1:])))
+        return 0
+    if cmd == "upload":
+        if len(argv) < 2:
+            die("usage: coworker upload <channel-id> <file> [comment]")
+        slack_upload(load_env(home_dir()), argv[0], Path(argv[1]), " ".join(argv[2:]))
+        return 0
+    die(f"unknown command {cmd!r} (coworker --help)")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -90,11 +90,12 @@ git clone <this repo> && cd kb-engine
 ./install.sh
 ```
 
-`install.sh` checks dependencies (`git`, `uv`, `python3`), bootstraps an empty `kb-data/`, symlinks the slash commands into `~/.claude/commands/`, the `kb-recall` skill into `~/.claude/skills/`, and the `kb-researcher` subagent into `~/.claude/agents/`, writes `KB_ENGINE_DIR` and `KB_DATA_DIR` into `~/.claude/settings.json`, registers the hooks (SessionStart tiered ambient payload, UserPromptSubmit semantic auto-recall, SessionEnd capture-candidate queue, PreToolUse permission hook so KB queries never hit a permission prompt) and — on macOS, after its own prompt — a nightly launchd librarian (validate, auto-commit kb-data — opt out with `touch $KB_DATA_DIR/.no-autocommit` — sync, doctor delta, ledger scan, log rotation, digest; weekly headless critic), adds permission allow rules for the engine scripts plus `kb-data` as an additional working directory, and installs the git pre-commit hooks: the schema validator in kb-data, and a **leak guard** in kb-engine itself that blocks any commit containing a term from the private `$KB_DATA_DIR/_banned-terms.txt` (the engine repo is public; your KB's names must never end up in it — and the banned list itself lives outside the repo so it never ships). It prompts before editing `~/.claude/settings.json`, is **idempotent / re-runnable**, and supports `--uninstall`.
+`install.sh` checks dependencies (`git`, `uv`, `python3`), bootstraps an empty `kb-data/`, symlinks the slash commands into `~/.claude/commands/`, the `kb-recall` skill into `~/.claude/skills/`, and the `kb-researcher` subagent into `~/.claude/agents/`, writes `KB_ENGINE_DIR` and `KB_DATA_DIR` into `~/.claude/settings.json`, registers the hooks (SessionStart tiered ambient payload, UserPromptSubmit semantic auto-recall, SessionEnd capture-candidate queue, PreToolUse permission hook so KB queries never hit a permission prompt) and — after its own prompt — a nightly librarian (launchd on macOS, a systemd user timer on Linux: validate, auto-commit kb-data — opt out with `touch $KB_DATA_DIR/.no-autocommit` — sync, doctor delta, ledger scan, log rotation, digest; weekly headless critic), adds permission allow rules for the engine scripts plus `kb-data` as an additional working directory, and installs the git pre-commit hooks: the schema validator in kb-data, and a **leak guard** in kb-engine itself that blocks any commit containing a term from the private `$KB_DATA_DIR/_banned-terms.txt` (the engine repo is public; your KB's names must never end up in it — and the banned list itself lives outside the repo so it never ships). It prompts before editing `~/.claude/settings.json`, is **idempotent / re-runnable**, and supports `--uninstall`.
 
 - Keep content elsewhere: `./install.sh --kb-data /path/to/kb-data`
 - Skip the settings prompt: `./install.sh --yes`
 - Remove all wiring (content untouched): `./install.sh --uninstall`
+- Optional: make the machine an always-on co-worker: `./install.sh --coworker` (see [Co-worker mode](#co-worker-mode-optional))
 
 Then open a new Claude Code session (or run `/hooks` to reload) and try `/find <something>`.
 
@@ -117,7 +118,7 @@ Claude Code refuses to prefix-match allow rules against commands containing vari
 - `skills/kb-recall/` — proactive-recall skill (symlinked into `~/.claude/skills` by install).
 - `agents/kb-researcher.md` — cheap read-only extraction subagent (symlinked into `~/.claude/agents` by install; used by `/ask` and `kb-recall`).
 - `librarian/procedure-file.md` — canonical filing procedure shared by the slash command and the headless librarian script. Since v4 the LLM only distills a small JSON payload; `kb file` writes the leaf (machine-rendered transcript, schema validation, route bookkeeping, index refresh).
-- `scripts/kb` — the deterministic CLI (see below). `scripts/kb-mcp` — MCP adapter over the CLI (stdio, or loopback HTTP with optional writes for a team KB). `scripts/validate.py` — schema validator. `scripts/audit-topics.py` — topic normalization. `scripts/librarian` — headless maintenance (file / split / collapse / dedup / criticize / mine-recipes). `scripts/librarian-nightly` — the deterministic nightly job (launchd).
+- `scripts/kb` — the deterministic CLI (see below). `scripts/kb-mcp` — MCP adapter over the CLI (stdio, or loopback HTTP with optional writes for a team KB). `scripts/validate.py` — schema validator. `scripts/audit-topics.py` — topic normalization. `scripts/librarian` — headless maintenance (file / split / collapse / dedup / criticize / mine-recipes). `scripts/librarian-nightly` — the deterministic nightly job (launchd / systemd). `scripts/coworker` — co-worker mode: routine-agent runner, timers, secret-checked sync, Slack posting. `scripts/slack-agent` — the cheap Slack watcher.
 - `hooks/session-start.sh` — tiered ambient payload (`kb ambient`). `hooks/auto-recall.sh` — semantic per-prompt recall (`kb recall`, registered by default). `hooks/capture-candidate.sh` — SessionEnd unfiled-session queue. `hooks/allow-kb-query.sh` — PreToolUse permission hook (see above). `hooks/pre-commit` — schema validator gate (kb-data). `hooks/pre-commit-no-leaks` — leak guard on the engine repo itself, scanning every commit against the private `$KB_DATA_DIR/_banned-terms.txt`. `hooks/normalize-topics.sh` — retired from per-session use (nightly `kb sync` covers it). `hooks/session-end.sh` — legacy unconditional auto-file (off by default).
 
 ## The `kb` CLI
@@ -228,6 +229,17 @@ Two things make this more than a search endpoint:
 Binding to anything but loopback is refused without `--insecure-bind`: on a shared
 network a routable bind is readable by everyone on it. Access control is whoever can
 open the tunnel, i.e. the host's ssh login.
+
+## Co-worker mode (optional)
+
+`./install.sh --coworker` turns a machine (an always-on VM, or your laptop) into a personal co-worker: routine agents on timers that scout, watch and report, filing every run into the KB. Your instance (agent prompts, facts prefix, schedule, Slack ids) lives in a private **co-worker home** (`~/coworker`); the engine supplies the mechanics:
+
+- `coworker run <agent> [slot]` — the runner pattern: context from `kb facts`, one headless `claude -p` confined to a run folder (no MCP servers, no tokens, no user hooks), validate `entry.json`, `kb file --jot`, post `slack.txt` only if the agent wrote one, deterministic escalation on newly seen entities, `coworker sync`.
+- `coworker schedule <agent> <slot> "07:30"` — systemd user timers on Linux, launchd on macOS; a human runs it, agents never schedule themselves.
+- `coworker sync` — commit + push of the home (and the KB unless `.no-autocommit`), refused when the diff contains anything token-shaped.
+- `scripts/slack-agent` — a small-model Slack watcher whose event log the main session `Monitor`s.
+
+Full runbook: [`docs/coworker.md`](docs/coworker.md).
 
 ## Filing stays a human decision — but a 2-second one
 
