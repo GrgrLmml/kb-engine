@@ -1,0 +1,9 @@
+# runtime state: run folders, logs, cursors, locks
+state/
+# search index and librarian runtime, if the KB lives inside this home
+kb/.index/
+kb/.librarian/
+kb/.kb-write.lock/
+# anything that may hold a token
+*mcp*.json
+.DS_Store

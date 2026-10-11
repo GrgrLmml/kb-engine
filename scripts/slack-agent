@@ -1,0 +1,291 @@
+#!/bin/bash
+# slack-agent — a cheap, persistent Slack sidekick for the main Claude session.
+#
+# Runs a headless small-model child (agents/slack-watcher.md) that polls Slack
+# with your bot's token (read+write on channels the bot is a member of),
+# triages new messages against a WATCH brief, and appends noteworthy events to
+# a log the main session can `Monitor`. Between ticks no model runs: each tick
+# is one `claude -p` call, resumed from the previous tick's session so the
+# child keeps conversational memory cheaply.
+#
+# Usage:
+#   slack-agent setup  <name> --channels C1,C2 [--watch U1,U2] [--owner U0] [--bot-name N] [--brief "..."]
+#   slack-agent run    <name> [--every 120]   # foreground loop (under systemd/launchd: coworker daemon)
+#   slack-agent start  <name> --channels ... [--every 120]   # setup + run in the background
+#   slack-agent say    <name> <channel> "<text>" [--thread <ts>]
+#   slack-agent tick   <name>            # one pass now (also sends anything queued)
+#   slack-agent status <name>
+#   slack-agent log    <name> [-f]       # the event log (this is what Monitor reads)
+#   slack-agent stop   <name>
+#
+# Config: --owner / --bot-name default to SLACK_OWNER_ID / SLACK_BOT_NAME from
+# $COWORKER_HOME/coworker.env (see docs/coworker.md). The token is read at run
+# time via SLACK_TOKEN_CMD (default: `claude mcp get slack-mcp`), written into
+# a per-tick MCP config (mode 600) for the child, and deleted after the tick.
+#
+# State lives in $SLACK_AGENT_DIR (default ~/.slack-agent/<name>/):
+#   brief.md  channels  cursor  events.log  session_id  pid  outbox/  ticks.log
+
+set -uo pipefail
+
+: "${KB_ENGINE_DIR:=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+: "${SLACK_AGENT_DIR:=$HOME/.slack-agent}"
+AGENT_MD="$KB_ENGINE_DIR/agents/slack-watcher.md"
+MODEL="${SLACK_AGENT_MODEL:-sonnet}"
+
+# Instance config (owner id, bot name, team id, token command) from the
+# co-worker home, if there is one.
+: "${COWORKER_HOME:=$HOME/coworker}"
+if [ -f "$COWORKER_HOME/coworker.env" ]; then
+  set -a; . "$COWORKER_HOME/coworker.env"; set +a
+fi
+: "${SLACK_TOKEN_CMD:=claude mcp get slack-mcp}"
+
+usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+
+cmd="${1:-}"; name="${2:-}"
+[ -n "$cmd" ] && [ -n "$name" ] || usage
+shift 2
+dir="$SLACK_AGENT_DIR/$name"
+
+# ---------- helpers ----------
+
+# The bot token, read from the CLI's local MCP config so it lives in exactly
+# one place. Never printed, never written anywhere but the per-tick MCP config.
+slack_token() {
+  ( [ -n "${SLACK_MCP_CWD:-}" ] && cd "$SLACK_MCP_CWD"; eval "$SLACK_TOKEN_CMD" ) 2>/dev/null \
+    | grep -oE 'xox[bp]-[A-Za-z0-9-]+' | head -1
+}
+
+# The child's slack-mcp server config, written fresh each tick (mode 600) and
+# removed afterwards, so no token-bearing file sits in any repo.
+write_mcp_config() {
+  local tok="$1" out="$2"
+  ( umask 077
+    SLACK_TOK="$tok" python3 -c '
+import json, os, sys
+env = {"SLACK_BOT_TOKEN": os.environ["SLACK_TOK"]}
+if os.environ.get("SLACK_TEAM_ID"):
+    env["SLACK_TEAM_ID"] = os.environ["SLACK_TEAM_ID"]
+json.dump({"mcpServers": {"slack-mcp": {
+    "command": "npx", "args": ["-y", "@modelcontextprotocol/server-slack"], "env": env}}},
+    open(sys.argv[1], "w"))
+' "$out" )
+}
+
+# Messages newer than the cursor across all watched channels, as compact JSON
+# lines the child reads. Reactions come inline from Slack.
+#
+# Thread replies: conversations.history only returns top-level messages, so a
+# reply under an older post would never show up. Each tick also scans the
+# last THREAD_LOOKBACK_DAYS of parents for latest_reply > cursor and pulls
+# those replies with conversations.replies.
+THREAD_LOOKBACK_DAYS="${SLACK_AGENT_THREAD_DAYS:-7}"
+fetch_new() {
+  local tok="$1" since="$2" channels="$3"
+  SLACK_TOK="$tok" REACTIONS_SEEN="$dir/reactions_seen" python3 - "$since" "$channels" "$THREAD_LOOKBACK_DAYS" <<'PY'
+import json, os, sys, time, urllib.parse, urllib.request
+
+since, channels, days = sys.argv[1], sys.argv[2].split(","), float(sys.argv[3])
+tok = os.environ["SLACK_TOK"]
+# Reactions arrive on messages older than the cursor (a thumbs-up on a post
+# from hours before), so they are tracked separately: every reaction on
+# a message in the lookback window is keyed ts:emoji:user and emitted once.
+# The first run seeds the file silently so history is not replayed.
+seen_path = os.environ["REACTIONS_SEEN"]
+first_run = not os.path.exists(seen_path)
+seen = set(open(seen_path).read().split()) if not first_run else set()
+new_seen = []
+
+def api(method, **params):
+    url = f"https://slack.com/api/{method}?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {tok}"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.load(r)
+    except Exception:
+        return {}
+
+def emit(ch, m):
+    if m.get("subtype") in ("channel_join", "channel_leave"):
+        return
+    print(json.dumps({"channel": ch, "ts": m["ts"], "user": m.get("user") or m.get("bot_id"),
+                      "thread_ts": m.get("thread_ts"), "text": m.get("text", "")[:1500],
+                      "reactions": [r["name"] + ":" + ",".join(r.get("users", [])) for r in m.get("reactions", [])]}))
+
+for ch in channels:
+    out = {}
+    for m in api("conversations.history", channel=ch, oldest=since, limit=50).get("messages", []):
+        out[m["ts"]] = m
+    lookback = f"{time.time() - days * 86400:.6f}"
+    parents = api("conversations.history", channel=ch, oldest=lookback, limit=200).get("messages", [])
+    for p in parents:
+        if float(p.get("latest_reply") or 0) <= float(since):
+            continue
+        for r in api("conversations.replies", channel=ch, ts=p["ts"], oldest=since, limit=100).get("messages", []):
+            if r["ts"] != p["ts"] and float(r["ts"]) > float(since):
+                out[r["ts"]] = r
+    for ts in sorted(out, key=float):
+        emit(ch, out[ts])
+    for m in list(parents) + [m for m in out.values() if m["ts"] not in {p["ts"] for p in parents}]:
+        for r in m.get("reactions", []):
+            for u in r.get("users", []):
+                key = f"{m['ts']}:{r['name']}:{u}"
+                if key in seen:
+                    continue
+                new_seen.append(key)
+                if not first_run:
+                    print(json.dumps({"type": "reaction", "channel": ch, "ts": m["ts"], "user": u,
+                                      "reaction": r["name"], "on_user": m.get("user") or m.get("bot_id"),
+                                      "on_text": (m.get("text") or "")[:300]}))
+if new_seen:
+    with open(seen_path, "a") as f:
+        f.write("".join(k + "\n" for k in new_seen))
+PY
+}
+
+# One tick: gather new messages (+ any queued SAY), run the child, log events,
+# advance the cursor. Safe to run by hand.
+tick() {
+  local tok since new say_block="" outfile
+  tok=$(slack_token) || { echo "no slack token" >&2; return 1; }
+  since=$(cat "$dir/cursor")
+  new=$(fetch_new "$tok" "$since" "$(cat "$dir/channels")")
+
+  for f in "$dir"/outbox/*.json; do
+    [ -e "$f" ] || break
+    say_block+=$'\n'"SAY: $(cat "$f")"
+    rm -f "$f"
+  done
+
+  if [ -z "$new" ] && [ -z "$say_block" ]; then
+    echo "$(date -u +%FT%TZ) tick: nothing new" >> "$dir/ticks.log"
+    return 0
+  fi
+
+  local prompt
+  prompt="WATCH BRIEF:
+$(cat "$dir/brief.md")
+${say_block}
+
+NEW MESSAGES SINCE LAST TICK (JSON lines; empty means none):
+${new:-<none>}"
+
+  local mcp="$dir/.mcp-tick.json"
+  write_mcp_config "$tok" "$mcp"
+  local args=(-p --model "$MODEL" --output-format text --setting-sources local \
+              --strict-mcp-config --mcp-config "$mcp" \
+              --append-system-prompt-file "$AGENT_MD" \
+              --allowedTools "mcp__slack-mcp__slack_get_thread_replies,mcp__slack-mcp__slack_post_message,mcp__slack-mcp__slack_reply_to_thread,mcp__slack-mcp__slack_get_user_profile")
+  local sid=""
+  if [ -s "$dir/session_id" ]; then
+    args+=(--resume "$(cat "$dir/session_id")")
+  else
+    sid=$(uuidgen | tr 'A-Z' 'a-z')
+    args+=(--session-id "$sid")
+  fi
+
+  outfile=$(mktemp)
+  if ! printf '%s' "$prompt" | claude "${args[@]}" > "$outfile" 2>>"$dir/ticks.log"; then
+    # a failed resume (expired session) falls back to a fresh session next tick
+    echo "$(date -u +%FT%TZ) tick: claude exited non-zero; clearing session" >> "$dir/ticks.log"
+    : > "$dir/session_id"
+  elif [ -n "$sid" ]; then
+    echo "$sid" > "$dir/session_id"
+  fi
+  rm -f "$mcp"
+
+  grep -E '^(EVENT|POSTED) ' "$outfile" | while IFS= read -r line; do
+    echo "$(date -u +%FT%TZ) $line" >> "$dir/events.log"
+  done
+  local n; n=$(grep -cE '^(EVENT|POSTED) ' "$outfile" || true)
+  echo "$(date -u +%FT%TZ) tick: $(printf '%s' "$new" | grep -c . || true) msgs, $n events" >> "$dir/ticks.log"
+  rm -f "$outfile"
+
+  local newest
+  newest=$(printf '%s' "$new" | python3 -c 'import sys,json; ts=[json.loads(l)["ts"] for l in sys.stdin if l.strip()]; print(max(ts, key=float) if ts else "")')
+  [ -n "$newest" ] && echo "$newest" > "$dir/cursor"
+  return 0
+}
+
+loop() {
+  local every="$1"
+  while true; do
+    tick
+    sleep "$every"
+  done
+}
+
+# ---------- commands ----------
+
+setup() {
+  local channels="" watch="" brief="" owner="${SLACK_OWNER_ID:-}" bot="${SLACK_BOT_NAME:-}"
+  every=120
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --channels) channels="$2"; shift 2 ;;
+      --watch)    watch="$2"; shift 2 ;;
+      --owner)    owner="$2"; shift 2 ;;
+      --bot-name) bot="$2"; shift 2 ;;
+      --brief)    brief="$2"; shift 2 ;;
+      --every)    every="$2"; shift 2 ;;
+      *) usage ;;
+    esac
+  done
+  [ -n "$channels" ] || { echo "--channels required" >&2; exit 1; }
+  [ -n "$owner" ] || { echo "--owner <your Slack user id> required (or SLACK_OWNER_ID in coworker.env)" >&2; exit 1; }
+  [ -n "$(slack_token)" ] || { echo "no Slack token from: $SLACK_TOKEN_CMD" >&2; exit 1; }
+  mkdir -p "$dir/outbox"
+  echo "$channels" > "$dir/channels"
+  date +%s > "$dir/cursor"          # start from now; history is not replayed
+  : > "$dir/session_id"
+  {
+    echo "Channels: $channels"
+    [ -n "$watch" ] && echo "Watched people (user ids; always noteworthy): $watch"
+    echo "The owner is <@$owner> ($owner).${bot:+ You post as the bot $bot.}"
+    [ -n "$brief" ] && { echo; echo "$brief"; }
+  } > "$dir/brief.md"
+  : >> "$dir/events.log"
+  echo "configured $name on $channels (events: $dir/events.log)"
+}
+
+case "$cmd" in
+  setup)  setup "$@" ;;
+  start)
+    setup "$@"
+    nohup bash "$0" _loop "$name" "$every" > /dev/null 2>>"$dir/ticks.log" &
+    echo $! > "$dir/pid"
+    echo "started $name (pid $!) every ${every}s"
+    ;;
+  run)
+    [ -f "$dir/channels" ] || { echo "not configured: slack-agent setup $name --channels ..." >&2; exit 1; }
+    every=120
+    [ "${1:-}" = "--every" ] && every="${2:-120}"
+    echo $$ > "$dir/pid"
+    loop "$every"
+    ;;
+  _loop)  loop "${1:-120}" ;;
+  say)
+    ch="${1:-}"; text="${2:-}"; thread=""
+    [ -n "$ch" ] && [ -n "$text" ] || usage
+    [ "${3:-}" = "--thread" ] && thread="${4:-}"
+    mkdir -p "$dir/outbox"
+    python3 -c 'import sys,json; print(json.dumps({"channel": sys.argv[1], "text": sys.argv[2], "thread_ts": sys.argv[3] or None}))' \
+      "$ch" "$text" "$thread" > "$dir/outbox/$(date +%s%N).json"
+    echo "queued for next tick (or: slack-agent tick $name to send now)"
+    ;;
+  tick)   tick ;;
+  status)
+    if [ -f "$dir/pid" ] && kill -0 "$(cat "$dir/pid")" 2>/dev/null; then echo "running (pid $(cat "$dir/pid"))"; else echo "not running"; fi
+    echo "channels: $(cat "$dir/channels" 2>/dev/null)"
+    echo "cursor:   $(cat "$dir/cursor" 2>/dev/null)"
+    echo "events:   $(wc -l < "$dir/events.log" 2>/dev/null | tr -d ' ')"
+    echo "outbox:   $(ls "$dir/outbox" 2>/dev/null | wc -l | tr -d ' ') queued"
+    tail -3 "$dir/ticks.log" 2>/dev/null
+    ;;
+  log)    if [ "${1:-}" = "-f" ]; then tail -n 20 -f "$dir/events.log"; else cat "$dir/events.log"; fi ;;
+  stop)
+    if [ -f "$dir/pid" ]; then kill "$(cat "$dir/pid")" 2>/dev/null && echo "stopped $name"; rm -f "$dir/pid"; else echo "not running"; fi
+    ;;
+  *) usage ;;
+esac

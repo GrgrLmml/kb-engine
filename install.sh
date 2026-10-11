@@ -4,16 +4,22 @@
 # Global install: symlinks the slash commands into ~/.claude/commands, writes
 # KB_ENGINE_DIR / KB_DATA_DIR into ~/.claude/settings.json (so commands,
 # scripts, and hooks resolve their paths), registers the SessionStart
-# ambient-index hook, installs the nightly librarian launchd agent (validate +
-# autosave + sync + doctor delta + problems scan + digest), bootstraps an
-# empty kb-data, and installs the git pre-commit validator.
+# ambient-index hook, installs the nightly librarian (launchd on macOS, a
+# systemd user timer on Linux: validate + autosave + sync + doctor delta +
+# problems scan + digest), bootstraps an empty kb-data, and installs the git
+# pre-commit validator.
 #
 # Usage:
-#   ./install.sh [--kb-data PATH] [--yes] [--uninstall]
+#   ./install.sh [--kb-data PATH] [--yes] [--coworker [--home PATH]] [--uninstall]
 #
 #   --kb-data PATH   Where your KB content lives (default: <repo>/kb-data).
 #   --yes            Don't prompt before editing ~/.claude/settings.json.
-#   --uninstall      Remove command symlinks, the hook, env vars, pre-commit.
+#   --coworker       Optional: also make this machine an always-on co-worker
+#                    (scaffolds a co-worker home, sets COWORKER_HOME, offers an
+#                    hourly repo-sync timer). See docs/coworker.md.
+#   --home PATH      Co-worker home (default: ~/coworker).
+#   --uninstall      Remove command symlinks, the hook, env vars, pre-commit,
+#                    the nightly job and any co-worker timers (home is kept).
 #
 # Re-runnable (idempotent). Never touches your KB *content*, only wiring.
 
@@ -35,6 +41,11 @@ CHECK_HOOK="$KB_ENGINE_DIR/hooks/check-tool-output.sh"
 KB_DATA_DIR="$KB_ENGINE_DIR/kb-data"
 ASSUME_YES=0
 UNINSTALL=0
+COWORKER=0
+COWORKER_HOME_ARG=""
+COWORKER_BIN="$KB_ENGINE_DIR/scripts/coworker"
+SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
+NIGHTLY_UNIT="kb-librarian-nightly"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -42,7 +53,10 @@ while [ $# -gt 0 ]; do
     --kb-data=*) KB_DATA_DIR="${1#*=}"; shift ;;
     --yes|-y) ASSUME_YES=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
-    -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --coworker) COWORKER=1; shift ;;
+    --home) COWORKER_HOME_ARG="$2"; shift 2 ;;
+    --home=*) COWORKER_HOME_ARG="${1#*=}"; shift ;;
+    -h|--help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -58,6 +72,15 @@ PY="$(command -v python3 || true)"
 # --- uninstall -----------------------------------------------------------
 if [ "$UNINSTALL" = 1 ]; then
   echo "Uninstalling KB wiring (your kb-data content is left untouched)…"
+  # Co-worker timers/daemons first, while COWORKER_HOME is still resolvable.
+  cw_home="${COWORKER_HOME_ARG:-${COWORKER_HOME:-}}"
+  if [ -z "$cw_home" ] && [ -f "$SETTINGS" ] && [ -n "$PY" ]; then
+    cw_home="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("env",{}).get("COWORKER_HOME",""))' "$SETTINGS" 2>/dev/null || true)"
+  fi
+  if [ -n "$cw_home" ] && [ -f "$cw_home/coworker.env" ]; then
+    COWORKER_HOME="$cw_home" "$COWORKER_BIN" unschedule --all || true
+    ok "removed co-worker timers (home $cw_home kept)"
+  fi
   if [ -d "$CMD_DIR" ]; then
     for src in "$KB_ENGINE_DIR"/commands/*.md; do
       link="$CMD_DIR/$(basename "$src")"
@@ -83,6 +106,7 @@ p, mech, data, *ours = sys.argv[1:]
 d = json.load(open(p))
 d.get("env", {}).pop("KB_ENGINE_DIR", None)
 d.get("env", {}).pop("KB_DATA_DIR", None)
+d.get("env", {}).pop("COWORKER_HOME", None)
 if d.get("env") == {}: d.pop("env", None)
 hooks = d.get("hooks", {})
 for event in ("SessionEnd", "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse"):
@@ -121,6 +145,12 @@ PYEOF
   if [ -f "$plist" ]; then
     launchctl unload "$plist" 2>/dev/null || true
     rm -f "$plist"; ok "removed nightly librarian launchd agent"
+  fi
+  if [ -f "$SYSTEMD_USER_DIR/$NIGHTLY_UNIT.timer" ]; then
+    systemctl --user disable --now "$NIGHTLY_UNIT.timer" 2>/dev/null || true
+    rm -f "$SYSTEMD_USER_DIR/$NIGHTLY_UNIT.timer" "$SYSTEMD_USER_DIR/$NIGHTLY_UNIT.service"
+    systemctl --user daemon-reload 2>/dev/null || true
+    ok "removed nightly librarian systemd timer"
   fi
   echo "Done."
   exit 0
@@ -360,8 +390,52 @@ EOF
     launchctl load "$PLIST" 2>/dev/null && ok "nightly agent loaded ($PLIST_LABEL, 03:30)" \
       || warn "wrote $PLIST but launchctl load failed — load it manually"
   fi
+elif command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+  do_unit=1
+  if [ "$ASSUME_YES" != 1 ]; then
+    if [ -t 0 ]; then
+      say "Will install a systemd user timer ($NIGHTLY_UNIT, 03:30 UTC daily) that"
+      say "runs scripts/librarian-nightly: validate, autosave kb-data, kb sync,"
+      say "doctor delta, problems scan, digest, plus the weekly criticize pass."
+      printf "  Install nightly timer? [y/N] "; read -r ans; [ "$ans" = y ] || [ "$ans" = Y ] || do_unit=0
+    else
+      do_unit=0; warn "non-interactive and no --yes; skipping nightly timer"
+    fi
+  fi
+  if [ "$do_unit" = 1 ]; then
+    mkdir -p "$SYSTEMD_USER_DIR" "$KB_DATA_DIR/.librarian"
+    cat > "$SYSTEMD_USER_DIR/$NIGHTLY_UNIT.service" <<EOF
+[Unit]
+Description=kb-engine nightly librarian
+
+[Service]
+Type=oneshot
+Environment=KB_ENGINE_DIR=$KB_ENGINE_DIR
+Environment=KB_DATA_DIR=$KB_DATA_DIR
+Environment=PATH=$HOME/.local/bin:$(dirname "$(command -v uv)"):/usr/local/bin:/usr/bin:/bin
+ExecStart=$KB_ENGINE_DIR/scripts/librarian-nightly
+StandardOutput=append:$KB_DATA_DIR/.librarian/nightly.out
+StandardError=append:$KB_DATA_DIR/.librarian/nightly.err
+TimeoutStartSec=3600
+EOF
+    cat > "$SYSTEMD_USER_DIR/$NIGHTLY_UNIT.timer" <<EOF
+[Unit]
+Description=kb-engine nightly librarian (03:30 UTC)
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl --user daemon-reload
+    systemctl --user enable --now "$NIGHTLY_UNIT.timer" >/dev/null 2>&1 \
+      && ok "nightly timer enabled ($NIGHTLY_UNIT.timer, 03:30 UTC)" \
+      || warn "wrote $SYSTEMD_USER_DIR/$NIGHTLY_UNIT.timer but enable failed — run: systemctl --user enable --now $NIGHTLY_UNIT.timer"
+  fi
 else
-  warn "not macOS — schedule scripts/librarian-nightly via cron yourself (e.g. 30 3 * * *)"
+  warn "no launchd or systemd user session — schedule scripts/librarian-nightly via cron yourself (e.g. 30 3 * * *)"
 fi
 echo
 
@@ -373,6 +447,53 @@ else
   warn "index build failed — it will self-build on first 'kb search'"
 fi
 echo
+
+# --- 8. co-worker (optional) -----------------------------------------------
+if [ "$COWORKER" = 1 ]; then
+  echo "8. Co-worker…"
+  CW_HOME="${COWORKER_HOME_ARG:-${COWORKER_HOME:-$HOME/coworker}}"
+  CW_HOME="$(mkdir -p "$CW_HOME" && cd "$CW_HOME" && pwd)"
+  command -v claude >/dev/null 2>&1 && ok "claude CLI" \
+    || warn "claude CLI missing — npm i -g @anthropic-ai/claude-code, then log in once interactively"
+  command -v tmux >/dev/null 2>&1 && ok "tmux (keeps the main session alive)" \
+    || warn "tmux missing (optional) — the main agent runs best inside tmux on a server"
+  COWORKER_HOME="$CW_HOME" "$COWORKER_BIN" init "$CW_HOME" | sed 's/^/  /'
+  if [ -n "$PY" ] && [ -f "$SETTINGS" ]; then
+    "$PY" - "$SETTINGS" "$CW_HOME" <<'PYEOF'
+import json, sys
+p, home = sys.argv[1:]
+d = json.load(open(p))
+d.setdefault("env", {})["COWORKER_HOME"] = home
+json.dump(d, open(p, "w"), indent=2); open(p, "a").write("\n")
+PYEOF
+    ok "env.COWORKER_HOME=$CW_HOME in settings.json"
+  fi
+  if [ "$(uname)" = "Linux" ] && command -v loginctl >/dev/null 2>&1; then
+    if [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" = "yes" ]; then
+      ok "lingering enabled (timers run while you're logged out)"
+    else
+      warn "timers stop when you log out — run once: sudo loginctl enable-linger $USER"
+    fi
+  fi
+  do_sync=1
+  if [ "$ASSUME_YES" != 1 ]; then
+    if [ -t 0 ]; then
+      say "Install an hourly safety-net sync timer (secret-checked commit + push"
+      say "of the co-worker home)?"
+      printf "  Install sync timer? [y/N] "; read -r ans; [ "$ans" = y ] || [ "$ans" = Y ] || do_sync=0
+    else
+      do_sync=0; warn "non-interactive and no --yes; skipping sync timer (coworker schedule sync hourly hourly)"
+    fi
+  fi
+  if [ "$do_sync" = 1 ]; then
+    COWORKER_HOME="$CW_HOME" KB_DATA_DIR="$KB_DATA_DIR" "$COWORKER_BIN" schedule sync hourly hourly | sed 's/^/  /' \
+      || warn "sync timer not installed"
+  fi
+  say "Next: edit $CW_HOME/coworker.env, seed your facts, then"
+  say "  $COWORKER_BIN run example-scout --no-post"
+  say "Full runbook: $KB_ENGINE_DIR/docs/coworker.md"
+  echo
+fi
 
 echo "Done. Open a new Claude Code session (or run /hooks to reload) and try: /find <something>"
 echo "The compact KB index is now injected into every new session (pause: touch \$KB_DATA_DIR/.no-ambient)."
